@@ -97,6 +97,27 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
   });
 
   describe('Uniform envelopes, Decimal4 validation, and executeCommand over HTTP', () => {
+    async function createAuthHeaders(app: FastifyInstance): Promise<Record<string, string>> {
+      const signUpRes = await app.inject({
+        method: 'POST',
+        url: '/api/auth/sign-up/email',
+        payload: {
+          email: `spine-${uuidv7()}@inventory.local`,
+          password: 'password1234',
+          name: 'Spine Test User',
+        },
+      });
+      const token =
+        (signUpRes.headers['set-auth-token'] as string | undefined) ??
+        (signUpRes.json() as { token?: string }).token;
+      if (token) {
+        return { authorization: `Bearer ${token}` };
+      }
+      const setCookie = signUpRes.headers['set-cookie'];
+      const list = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
+      return { cookie: list.map((c) => c.split(';')[0]).join('; ') };
+    }
+
     function mountTestRoutes(app: FastifyInstance, db: ReturnType<typeof createDb>, dispatcher: OutboxDispatcher) {
       const typed = app.withTypeProvider<ZodTypeProvider>();
 
@@ -190,10 +211,11 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
       mountTestRoutes(app, db, dispatcher);
 
       try {
+        const authHeaders = await createAuthHeaders(app);
         const res = await app.inject({
           method: 'POST',
           url: '/api/v1/test-commands',
-          headers: { 'idempotency-key': uuidv7() },
+          headers: { ...authHeaders, 'idempotency-key': uuidv7() },
           payload: { quantity: '1.23456' },
         });
 
@@ -218,11 +240,12 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
       mountTestRoutes(app, db, dispatcher);
 
       try {
+        const authHeaders = await createAuthHeaders(app);
         const key = uuidv7();
         const res1 = await app.inject({
           method: 'POST',
           url: '/api/v1/test-commands',
-          headers: { 'idempotency-key': key },
+          headers: { ...authHeaders, 'idempotency-key': key },
           payload: { quantity: '10.5' },
         });
         expect(res1.statusCode).toBe(201);
@@ -231,7 +254,7 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
         const res2 = await app.inject({
           method: 'POST',
           url: '/api/v1/test-commands',
-          headers: { 'idempotency-key': key },
+          headers: { ...authHeaders, 'idempotency-key': key },
           payload: { quantity: '10.5' },
         });
         expect(res2.statusCode).toBe(201);
@@ -240,7 +263,7 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
         const conflictRes = await app.inject({
           method: 'POST',
           url: '/api/v1/test-commands',
-          headers: { 'idempotency-key': key },
+          headers: { ...authHeaders, 'idempotency-key': key },
           payload: { quantity: '99.0' },
         });
         expect(conflictRes.statusCode).toBe(409);
@@ -260,7 +283,12 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
       mountTestRoutes(app, db, dispatcher);
 
       try {
-        const res = await app.inject({ method: 'GET', url: '/api/v1/test-boom' });
+        const authHeaders = await createAuthHeaders(app);
+        const res = await app.inject({
+          method: 'GET',
+          url: '/api/v1/test-boom',
+          headers: authHeaders,
+        });
         expect(res.statusCode).toBe(500);
         const body = res.json();
         expect(body.error.code).toBe(ERROR_CODES.INTERNAL_ERROR);
@@ -278,7 +306,12 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
       mountTestRoutes(app, db, dispatcher);
 
       try {
-        const page1 = await app.inject({ method: 'GET', url: '/api/v1/test-items?limit=2' });
+        const authHeaders = await createAuthHeaders(app);
+        const page1 = await app.inject({
+          method: 'GET',
+          url: '/api/v1/test-items?limit=2',
+          headers: authHeaders,
+        });
         expect(page1.statusCode).toBe(200);
         const p1Body = page1.json();
         expect(p1Body.data).toHaveLength(2);
@@ -288,6 +321,7 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
         const page2 = await app.inject({
           method: 'GET',
           url: `/api/v1/test-items?limit=2&cursor=${encodeURIComponent(p1Body.page.nextCursor)}`,
+          headers: authHeaders,
         });
         expect(page2.statusCode).toBe(200);
         const p2Body = page2.json();
@@ -295,14 +329,26 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
         expect(p2Body.page.hasMore).toBe(false);
         expect(p2Body.page.nextCursor).toBeNull();
 
-        const defaultLimit = await app.inject({ method: 'GET', url: '/api/v1/test-items' });
+        const defaultLimit = await app.inject({
+          method: 'GET',
+          url: '/api/v1/test-items',
+          headers: authHeaders,
+        });
         expect(defaultLimit.statusCode).toBe(200);
         expect(defaultLimit.json().page.limit).toBe(50);
 
-        const overLimit = await app.inject({ method: 'GET', url: '/api/v1/test-items?limit=101' });
+        const overLimit = await app.inject({
+          method: 'GET',
+          url: '/api/v1/test-items?limit=101',
+          headers: authHeaders,
+        });
         expect(overLimit.statusCode).toBe(422);
 
-        const badCursor = await app.inject({ method: 'GET', url: '/api/v1/test-items?cursor=not-valid' });
+        const badCursor = await app.inject({
+          method: 'GET',
+          url: '/api/v1/test-items?cursor=not-valid',
+          headers: authHeaders,
+        });
         expect(badCursor.statusCode).toBe(400);
         expect(badCursor.json().error.code).toBe(ERROR_CODES.INVALID_CURSOR);
 
