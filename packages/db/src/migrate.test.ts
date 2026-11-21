@@ -39,6 +39,27 @@ describe('database schema migrations', () => {
     const migrations = await pool.query<{ id: string }>(
       'SELECT id FROM shared._migrations ORDER BY id ASC;',
     );
-    expect(migrations.rows.map((r) => r.id)).toContain('0001_init_schemas.sql');
+    expect(migrations.rows.map((r) => r.id)).toEqual([
+      '0001_init_schemas.sql',
+      '0002_shared_outbox_idempotency.sql',
+    ]);
+
+    const tables = await pool.query<{ table_name: string }>(
+      `
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'shared'
+        AND table_name = ANY($1::text[])
+      ORDER BY table_name ASC;
+      `,
+      [['idempotency_keys', 'outbox_events', 'event_checkpoints', 'processed_events']],
+    );
+
+    expect(tables.rows.map((r) => r.table_name)).toEqual([
+      'event_checkpoints',
+      'idempotency_keys',
+      'outbox_events',
+      'processed_events',
+    ]);
   });
 });

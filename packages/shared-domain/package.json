@@ -17,6 +17,10 @@
     "./ids": {
       "types": "./dist/ids/index.d.ts",
       "default": "./dist/ids/index.js"
+    },
+    "./http": {
+      "types": "./dist/http/index.d.ts",
+      "default": "./dist/http/index.js"
     }
   },
   "scripts": {
