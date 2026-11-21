@@ -41,6 +41,25 @@ export interface CommandHandlerResult<T> {
   statusCode?: number | undefined;
 }
 
+export interface CommandPermissionCheck {
+  action: string;
+  resource: string;
+  context?: {
+    locationId?: string | undefined;
+    amount?: string | undefined;
+    quantity?: string | undefined;
+    pushesStockNegative?: boolean | undefined;
+  } | undefined;
+}
+
+export interface CommandAccessPolicy {
+  assertCan(
+    action: string,
+    resource: string,
+    context?: CommandPermissionCheck['context'],
+  ): void;
+}
+
 export interface CommandIntent<T> {
   actorId: string;
   method: string;
@@ -49,6 +68,8 @@ export interface CommandIntent<T> {
   idempotencyKey?: string | undefined;
   requireIdempotencyKey?: boolean | undefined;
   statusCode?: number | undefined;
+  accessPolicy?: CommandAccessPolicy | undefined;
+  permission?: CommandPermissionCheck | undefined;
   authorize?: (() => Promise<void> | void) | undefined;
   handler: (ctx: CommandContext) => Promise<CommandHandlerResult<T>>;
 }
@@ -136,6 +157,14 @@ export async function executeCommand<T>(
     throw new ForbiddenError(
       ERROR_CODES.ACCESS_READ_ONLY,
       'Mutations are blocked while system is in read-only mode',
+    );
+  }
+
+  if (intent.accessPolicy && intent.permission) {
+    intent.accessPolicy.assertCan(
+      intent.permission.action,
+      intent.permission.resource,
+      intent.permission.context,
     );
   }
 

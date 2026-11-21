@@ -5,6 +5,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { outboxEvents } from '../db/schema.js';
 import { OutboxDispatcher } from '../outbox/outboxDispatcher.js';
+import { resolvePolicy } from '../../modules/iam/public/index.js';
 import { deriveLineIdempotencyKey, executeCommand } from './executeCommand.js';
 
 const testDbUrl = process.env.TEST_DATABASE_URL;
@@ -189,5 +190,61 @@ describe('executeCommand unit-of-work seam', () => {
     expect(k1a).toBe(k1b);
     expect(k1a).not.toBe(k2);
     expect(k1a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it('enforces AccessSwitch (403 ACCESS_READ_ONLY / ACCESS_SUSPENDED) and AccessPolicy.assertCan', async () => {
+    const db = createDb(pool);
+    const policy = resolvePolicy(
+      { id: 'user-1', email: 'u@example.com', name: 'User' },
+      { locationScope: { locationIds: ['loc-1'] } },
+    );
+
+    await expect(
+      executeCommand(
+        {
+          actorId: 'user-1',
+          method: 'POST',
+          path: '/api/v1/test',
+          payload: {},
+          idempotencyKey: uuidv7(),
+          accessPolicy: policy,
+          permission: { action: 'create', resource: 'product', context: { locationId: 'loc-1' } },
+          handler: async () => ({ data: { ok: true } }),
+        },
+        { db, getAccessSwitch: () => 'READ_ONLY' },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403, code: ERROR_CODES.ACCESS_READ_ONLY });
+
+    await expect(
+      executeCommand(
+        {
+          actorId: 'user-1',
+          method: 'POST',
+          path: '/api/v1/test',
+          payload: {},
+          idempotencyKey: uuidv7(),
+          accessPolicy: policy,
+          permission: { action: 'create', resource: 'product', context: { locationId: 'loc-1' } },
+          handler: async () => ({ data: { ok: true } }),
+        },
+        { db, getAccessSwitch: () => 'SUSPENDED' },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403, code: ERROR_CODES.ACCESS_SUSPENDED });
+
+    await expect(
+      executeCommand(
+        {
+          actorId: 'user-1',
+          method: 'POST',
+          path: '/api/v1/test',
+          payload: {},
+          idempotencyKey: uuidv7(),
+          accessPolicy: policy,
+          permission: { action: 'create', resource: 'product', context: { locationId: 'loc-999' } },
+          handler: async () => ({ data: { ok: true } }),
+        },
+        { db, getAccessSwitch: () => 'ACTIVE' },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403, code: ERROR_CODES.FORBIDDEN });
   });
 });

@@ -42,6 +42,7 @@ describe('database schema migrations', () => {
     expect(migrations.rows.map((r) => r.id)).toEqual([
       '0001_init_schemas.sql',
       '0002_shared_outbox_idempotency.sql',
+      '0003_iam_auth_and_access_switch.sql',
     ]);
 
     const tables = await pool.query<{ table_name: string }>(

@@ -10,7 +10,11 @@ import {
 } from 'fastify-type-provider-zod';
 import type { Pool } from 'pg';
 import { CATALOG_MODULE } from './modules/catalog/public/index.js';
-import { IAM_MODULE } from './modules/iam/public/index.js';
+import {
+  IAM_MODULE,
+  createAuth,
+  registerIamRoutes,
+} from './modules/iam/public/index.js';
 import { INVENTORY_MODULE } from './modules/inventory/public/index.js';
 import { ORDERS_MODULE } from './modules/orders/public/index.js';
 import {
@@ -62,6 +66,11 @@ export function buildApp(deps: AppDeps = {}): FastifyInstance {
   const rateLimitEnabled = deps.rateLimit?.enabled ?? nodeEnv !== 'test';
   if (rateLimitEnabled) {
     void registerRateLimiting(app, deps.rateLimit);
+  }
+
+  if (deps.db) {
+    const auth = createAuth(deps.db, { nodeEnv });
+    registerIamRoutes(app, { db: deps.db, auth });
   }
 
   app.get('/health', async () => {
