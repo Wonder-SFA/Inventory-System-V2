@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+.next/
+out/
+build/
+.turbo/
+*.tsbuildinfo
+apps/web/next-env.d.ts
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test & coverage
+coverage/
+
+# OS & Editor
+.DS_Store
+*.log
