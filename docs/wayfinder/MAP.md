@@ -32,11 +32,12 @@ A complete, decision-ready **Architecture & Domain Blueprint** for Inventory Sys
 - [008: Reporting & Analytics (Feature #4)](./tickets/008-reporting-and-analytics.md): Locked Weighted Average Cost (stored per-Location with Per-Location / Company-wide UI toggle and hover formula popovers), 4 core reports (Valuation, Low-Stock, Movement History, Turnover/Aging), CSV/Excel/PDF exports, `View Costs & Prices` gating, and event-driven summary tables + short-term caching.
 - [009: Cloud Access & Mobile Apps (Feature #6)](./tickets/009-cloud-access-and-mobile-apps.md): Locked containerized Managed Cloud Platform hosting (Railway/Render + Managed PostgreSQL, portable to Google Cloud for future SaaS), Server-Sent Events (SSE) for live screen updates, and a Phase 4 native mobile app (iOS/Android) with offline scanning where physical reality wins on reconnect and clashes become Manager Exceptions.
 - [010: Accounting & POS Integration (Feature #5)](./tickets/010-accounting-and-pos-integration.md): Replaced live accounting sync and full POS with an internal `finance` Cash & Expense Tracker (user-defined categories, payment-based Cash Balance, Owner/Admin gated) and a 1-step Quick Counter Sale screen, while keeping the Saved Event Log ready for future external Accounting/POS plug-ins.
+- [011: Final Architecture & Domain Blueprint Packaging](./tickets/011-final-architecture-and-domain-blueprint.md): Packaged all settled decisions from Tickets 001–010 into `docs/ARCHITECTURE_BLUEPRINT.md` (monorepo & feature-box structure, Phase 1 extension points, workflows, and phased roadmap), with final `GLOSSARY.md` polish and `docs/adr/` records queued for the dedicated `/domain-modeling` session.
 
 ## Not yet specified
 
 <!-- In-scope fog that depends on earlier decisions and will graduate into tickets as the frontier advances: -->
-- *(No remaining fog — all feature decisions are settled, and final blueprint packaging has graduated into [011: Final Architecture & Domain Blueprint Packaging](./tickets/011-final-architecture-and-domain-blueprint.md).)*
+- *(Wayfinder Map complete — all 11 tickets are closed. Next step: run `/domain-modeling` to finalize `GLOSSARY.md` and write key ADRs in `docs/adr/`.)*
 
 ## Out of scope
 
