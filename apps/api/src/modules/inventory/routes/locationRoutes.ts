@@ -15,9 +15,11 @@ import {
   deleteLocation,
   getLocationById,
   listLocations,
+  registerInventoryReferenceCheckers,
   setLocationStatus,
   updateLocation,
 } from '../domain/index.js';
+import { registerStockRoutes } from './stockRoutes.js';
 
 const LocationParamsSchema = z.object({
   id: z.string().uuid(),
@@ -33,6 +35,8 @@ export function registerInventoryRoutes(
   options: RegisterInventoryRoutesOptions,
 ): void {
   const { db, outboxDispatcher } = options;
+  registerInventoryReferenceCheckers();
+  registerStockRoutes(app, { db, outboxDispatcher });
   const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
   typedApp.post(
