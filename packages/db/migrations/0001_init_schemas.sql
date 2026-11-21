@@ -1,0 +1,6 @@
+-- Baseline schema isolation for Inventory System V2 (ADR-0001)
+CREATE SCHEMA IF NOT EXISTS catalog;
+CREATE SCHEMA IF NOT EXISTS inventory;
+CREATE SCHEMA IF NOT EXISTS orders;
+CREATE SCHEMA IF NOT EXISTS iam;
+CREATE SCHEMA IF NOT EXISTS shared;
