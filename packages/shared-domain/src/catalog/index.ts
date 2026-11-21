@@ -9,6 +9,7 @@ export const UnitOfMeasureSchema = z.object({
   id: z.string().uuid(),
   code: z.string().min(1),
   name: z.string().min(1),
+  status: CatalogStatusSchema,
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -20,7 +21,15 @@ export const CreateUnitOfMeasureSchema = z.object({
 });
 export type CreateUnitOfMeasureInput = z.infer<typeof CreateUnitOfMeasureSchema>;
 
-export const ListUnitsOfMeasureQuerySchema = CursorPaginationQuerySchema;
+export const UpdateUnitOfMeasureSchema = z.object({
+  code: z.string().trim().min(1, 'Code cannot be empty').max(32).optional(),
+  name: z.string().trim().min(1, 'Name cannot be empty').max(120).optional(),
+});
+export type UpdateUnitOfMeasureInput = z.infer<typeof UpdateUnitOfMeasureSchema>;
+
+export const ListUnitsOfMeasureQuerySchema = CursorPaginationQuerySchema.extend({
+  status: CatalogStatusSchema.optional(),
+});
 export type ListUnitsOfMeasureQuery = z.infer<typeof ListUnitsOfMeasureQuerySchema>;
 
 export const ProductSchema = z.object({

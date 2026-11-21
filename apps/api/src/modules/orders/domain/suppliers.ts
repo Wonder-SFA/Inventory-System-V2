@@ -14,23 +14,10 @@ import { type SQL, and, eq } from 'drizzle-orm';
 import {
   type DbTransaction,
   applyKeysetOrder,
+  getPgErrorCode,
   paginateKeysetResult,
 } from '../../../shared/index.js';
 import { type SupplierRow, purchaseOrders, suppliers } from '../db/index.js';
-
-function getPgErrorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) {
-    return undefined;
-  }
-  const err = error as { code?: unknown; cause?: { code?: unknown } };
-  if (typeof err.code === 'string') {
-    return err.code;
-  }
-  if (typeof err.cause?.code === 'string') {
-    return err.cause.code;
-  }
-  return undefined;
-}
 
 export function toSupplierDto(row: SupplierRow): Supplier {
   return {

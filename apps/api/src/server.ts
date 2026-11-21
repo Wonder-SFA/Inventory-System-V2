@@ -1,4 +1,4 @@
-import { createDb, createPool } from '@iv2/db';
+import { createDb, createPool, migrateDatabase } from '@iv2/db';
 import { buildApp } from './app.js';
 import { OutboxDispatcher } from './shared/outbox/index.js';
 
@@ -22,6 +22,9 @@ process.on('SIGINT', () => void shutdown());
 process.on('SIGTERM', () => void shutdown());
 
 try {
+  if (pool) {
+    await migrateDatabase(pool);
+  }
   await outboxDispatcher?.start();
   await app.listen({ port, host });
 } catch (err) {

@@ -41,25 +41,12 @@ export async function hasSkuReferences(db: CatalogDbExecutor, skuId: string): Pr
   return false;
 }
 
-export function isPgErrorCode(error: unknown, code: string): boolean {
-  if (typeof error !== 'object' || error === null) {
-    return false;
-  }
-  const err = error as { code?: unknown; cause?: unknown };
-  if (err.code === code) {
-    return true;
-  }
-  if (err.cause && typeof err.cause === 'object') {
-    return (err.cause as { code?: unknown }).code === code;
-  }
-  return false;
-}
-
 export function toUnitOfMeasureDto(row: UnitOfMeasureRow): UnitOfMeasure {
   return {
     id: row.id,
     code: row.code,
     name: row.name,
+    status: row.status,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -130,18 +117,28 @@ export async function getSkusByIds(
 
 export async function assertNoUnitOfMeasureConflict(
   db: CatalogDbExecutor,
-  code: string,
-  name: string,
+  fields: { code?: string | undefined; name?: string | undefined },
+  excludeUnitOfMeasureId?: string,
 ): Promise<void> {
+  const matchers = [];
+  if (fields.code !== undefined) {
+    matchers.push(sql`LOWER(${catalogUnitsOfMeasure.code}) = LOWER(${fields.code})`);
+  }
+  if (fields.name !== undefined) {
+    matchers.push(sql`LOWER(${catalogUnitsOfMeasure.name}) = LOWER(${fields.name})`);
+  }
+  if (matchers.length === 0) {
+    return;
+  }
+  const conflictExpr = matchers.length === 1 ? matchers[0]! : or(...matchers)!;
+  const where = excludeUnitOfMeasureId
+    ? and(conflictExpr, ne(catalogUnitsOfMeasure.id, excludeUnitOfMeasureId))
+    : conflictExpr;
+
   const [existing] = await db
-    .select({ id: catalogUnitsOfMeasure.id, code: catalogUnitsOfMeasure.code })
+    .select({ id: catalogUnitsOfMeasure.id })
     .from(catalogUnitsOfMeasure)
-    .where(
-      or(
-        sql`LOWER(${catalogUnitsOfMeasure.code}) = LOWER(${code})`,
-        sql`LOWER(${catalogUnitsOfMeasure.name}) = LOWER(${name})`,
-      ),
-    )
+    .where(where)
     .limit(1);
 
   if (existing) {

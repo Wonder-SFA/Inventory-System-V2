@@ -9,10 +9,12 @@ export const catalogUnitsOfMeasure = catalogSchema.table(
     id: uuid('id').primaryKey(),
     code: text('code').notNull(),
     name: text('name').notNull(),
+    status: text('status').$type<CatalogStatus>().notNull().default('ACTIVE'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    check('catalog_units_of_measure_status_check', sql`${table.status} IN ('ACTIVE', 'ARCHIVED')`),
     uniqueIndex('catalog_units_of_measure_code_lower_uidx').on(sql`LOWER(${table.code})`),
     uniqueIndex('catalog_units_of_measure_name_lower_uidx').on(sql`LOWER(${table.name})`),
     index('catalog_units_of_measure_created_id_idx').on(table.createdAt.desc(), table.id.desc()),

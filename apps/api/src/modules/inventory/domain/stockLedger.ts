@@ -887,6 +887,82 @@ function decodeBalanceCursor(cursor: string): { skuId: string; locationId: strin
   }
 }
 
+interface BalanceValuationInput {
+  skuId: string;
+  locationId: string | null;
+  onHand: Quantity;
+  reserved: Quantity;
+  available: Quantity;
+  inTransit: Quantity;
+  weightedAverageCost: UnitCost;
+  totalValue: Money;
+  currency: string;
+  updatedAt: Date | null;
+}
+
+async function buildBalanceValuationRows(
+  db: Database,
+  entries: BalanceValuationInput[],
+): Promise<StockBalance[]> {
+  if (entries.length === 0) {
+    return [];
+  }
+
+  const skuIds = [...new Set(entries.map((e) => e.skuId))];
+  const locIds = [
+    ...new Set(entries.map((e) => e.locationId).filter((id): id is string => id !== null)),
+  ];
+
+  const [skus, locRows] = await Promise.all([
+    getSkusByIds(db, skuIds),
+    locIds.length > 0
+      ? db
+          .select({ id: locations.id, name: locations.name })
+          .from(locations)
+          .where(inArray(locations.id, locIds))
+      : Promise.resolve([]),
+  ]);
+
+  const skuMap = new Map(skus.map((s) => [s.id, s]));
+  const locMap = new Map(locRows.map((l) => [l.id, l.name]));
+
+  return entries.map((entry) => {
+    const valuationStatus: ValuationStatus = isZeroOrNegative(entry.onHand)
+      ? 'ESTIMATED_NEGATIVE_STOCK'
+      : 'NORMAL';
+    const zeroOrNegativeFlag =
+      isZeroOrNegative(entry.onHand) || isZeroOrNegative(entry.available);
+    const sku = skuMap.get(entry.skuId);
+    const sellingPrice = sku?.defaultSellingPrice ?? null;
+    const { grossMargin, grossMarginPercent } = computeMargins(
+      sellingPrice,
+      entry.weightedAverageCost,
+    );
+
+    return {
+      skuId: entry.skuId,
+      skuCode: sku?.code ?? entry.skuId,
+      skuName: sku?.name ?? 'Unknown SKU',
+      locationId: entry.locationId,
+      locationName:
+        entry.locationId !== null ? (locMap.get(entry.locationId) ?? 'Unknown Location') : null,
+      onHand: entry.onHand,
+      reserved: entry.reserved,
+      available: entry.available,
+      inTransit: entry.inTransit,
+      weightedAverageCost: entry.weightedAverageCost,
+      totalValue: entry.totalValue,
+      sellingPrice,
+      grossMargin,
+      grossMarginPercent,
+      currency: entry.currency,
+      valuationStatus,
+      zeroOrNegativeFlag,
+      updatedAt: entry.updatedAt ? entry.updatedAt.toISOString() : null,
+    };
+  });
+}
+
 export async function listStockBalances(
   db: Database,
   scope: LocationScope,
@@ -929,10 +1005,7 @@ export async function listStockBalances(
       skuIds = skuIds.filter((id) => id > decoded.skuId);
     }
 
-    const skus = await getSkusByIds(db, skuIds);
-    const skuMap = new Map(skus.map((s) => [s.id, s]));
-
-    const aggregated: StockBalance[] = [];
+    const aggregatedEntries: BalanceValuationInput[] = [];
     for (const skuId of skuIds) {
       const group = bySku.get(skuId)!;
       let onHand = toQuantity('0');
@@ -963,10 +1036,6 @@ export async function listStockBalances(
         continue;
       }
 
-      const valuationStatus: ValuationStatus = isZeroOrNegative(onHand)
-        ? 'ESTIMATED_NEGATIVE_STOCK'
-        : 'NORMAL';
-
       let weightedAverageCost: UnitCost;
       if (isPositive(onHand)) {
         weightedAverageCost = toUnitCost(div(totalValue, onHand));
@@ -975,34 +1044,23 @@ export async function listStockBalances(
         totalValue = toMoney(mul(onHand, weightedAverageCost));
       }
 
-      const sku = skuMap.get(skuId);
-      const sellingPrice = sku?.defaultSellingPrice ?? null;
-      const { grossMargin, grossMarginPercent } = computeMargins(sellingPrice, weightedAverageCost);
-
-      aggregated.push({
+      aggregatedEntries.push({
         skuId,
-        skuCode: sku?.code ?? skuId,
-        skuName: sku?.name ?? 'Unknown SKU',
         locationId: null,
-        locationName: null,
         onHand,
         reserved,
         available,
         inTransit,
         weightedAverageCost,
         totalValue,
-        sellingPrice,
-        grossMargin,
-        grossMarginPercent,
         currency: group[0]?.currency ?? 'USD',
-        valuationStatus,
-        zeroOrNegativeFlag,
-        updatedAt: latestUpdatedAt ? latestUpdatedAt.toISOString() : null,
+        updatedAt: latestUpdatedAt,
       });
     }
 
-    const hasMore = aggregated.length > limit;
-    const items = hasMore ? aggregated.slice(0, limit) : aggregated;
+    const hasMore = aggregatedEntries.length > limit;
+    const pageEntries = hasMore ? aggregatedEntries.slice(0, limit) : aggregatedEntries;
+    const items = await buildBalanceValuationRows(db, pageEntries);
     const last = items[items.length - 1];
     const nextCursor = hasMore && last ? encodeBalanceCursor(last.skuId, null) : null;
     return { items, nextCursor, hasMore };
@@ -1041,58 +1099,25 @@ export async function listStockBalances(
   const hasMore = rows.length > limit;
   const pageRows = hasMore ? rows.slice(0, limit) : rows;
 
-  const skuIds = [...new Set(pageRows.map((r) => r.skuId))];
-  const locIds = [...new Set(pageRows.map((r) => r.locationId))];
-
-  const [skus, locRows] = await Promise.all([
-    getSkusByIds(db, skuIds),
-    locIds.length > 0
-      ? db
-          .select({ id: locations.id, name: locations.name })
-          .from(locations)
-          .where(inArray(locations.id, locIds))
-      : Promise.resolve([]),
-  ]);
-
-  const skuMap = new Map(skus.map((s) => [s.id, s]));
-  const locMap = new Map(locRows.map((l) => [l.id, l.name]));
-
-  const items: StockBalance[] = pageRows.map((row) => {
-    const onHand = toQuantity(row.onHand);
-    const reserved = toQuantity(row.reserved);
-    const available = toQuantity(row.available);
-    const inTransit = toQuantity(row.inTransit);
-    const wac = toUnitCost(row.weightedAverageCost);
-    const totalValue = toMoney(mul(onHand, wac));
-    const valuationStatus: ValuationStatus = isZeroOrNegative(onHand)
-      ? 'ESTIMATED_NEGATIVE_STOCK'
-      : 'NORMAL';
-    const zeroOrNegativeFlag = isZeroOrNegative(onHand) || isZeroOrNegative(available);
-    const sku = skuMap.get(row.skuId);
-    const sellingPrice = sku?.defaultSellingPrice ?? null;
-    const { grossMargin, grossMarginPercent } = computeMargins(sellingPrice, wac);
-
-    return {
-      skuId: row.skuId,
-      skuCode: sku?.code ?? row.skuId,
-      skuName: sku?.name ?? 'Unknown SKU',
-      locationId: row.locationId,
-      locationName: locMap.get(row.locationId) ?? 'Unknown Location',
-      onHand,
-      reserved,
-      available,
-      inTransit,
-      weightedAverageCost: wac,
-      totalValue,
-      sellingPrice,
-      grossMargin,
-      grossMarginPercent,
-      currency: row.currency,
-      valuationStatus,
-      zeroOrNegativeFlag,
-      updatedAt: row.updatedAt.toISOString(),
-    };
-  });
+  const items = await buildBalanceValuationRows(
+    db,
+    pageRows.map((row) => {
+      const onHand = toQuantity(row.onHand);
+      const weightedAverageCost = toUnitCost(row.weightedAverageCost);
+      return {
+        skuId: row.skuId,
+        locationId: row.locationId,
+        onHand,
+        reserved: toQuantity(row.reserved),
+        available: toQuantity(row.available),
+        inTransit: toQuantity(row.inTransit),
+        weightedAverageCost,
+        totalValue: toMoney(mul(onHand, weightedAverageCost)),
+        currency: row.currency,
+        updatedAt: row.updatedAt,
+      };
+    }),
+  );
 
   const last = items[items.length - 1];
   const nextCursor = hasMore && last ? encodeBalanceCursor(last.skuId, last.locationId) : null;

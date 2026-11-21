@@ -165,6 +165,92 @@ describe('catalog module integration', () => {
     expect(eventTypes).toContain('SkuCreated');
   });
 
+  it('supports Units of Measure PATCH, archive/unarchive, conflict checks, and status filtering', async () => {
+    const { app, db, cookie } = await setupAuthedApp();
+
+    const createBox = await app.inject({
+      method: 'POST',
+      url: '/api/v1/units-of-measure',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'box', name: 'Box' },
+    });
+    expect(createBox.statusCode).toBe(201);
+    const box = createBox.json().data;
+    expect(box.status).toBe('ACTIVE');
+
+    const createPack = await app.inject({
+      method: 'POST',
+      url: '/api/v1/units-of-measure',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'pack', name: 'Pack' },
+    });
+    expect(createPack.statusCode).toBe(201);
+    const pack = createPack.json().data;
+
+    // PATCH update code & name
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/units-of-measure/${box.id}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'CTN', name: 'Carton' },
+    });
+    expect(patchRes.statusCode).toBe(200);
+    expect(patchRes.json().data.code).toBe('CTN');
+    expect(patchRes.json().data.name).toBe('Carton');
+    expect(patchRes.json().data.status).toBe('ACTIVE');
+
+    // PATCH conflict on case-insensitive code or name -> 409 UNIT_OF_MEASURE_CONFLICT
+    const patchConflict = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/units-of-measure/${box.id}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'PACK' },
+    });
+    expect(patchConflict.statusCode).toBe(409);
+    expect(patchConflict.json().error.code).toBe(ERROR_CODES.UNIT_OF_MEASURE_CONFLICT);
+
+    // Archive box
+    const archiveRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/units-of-measure/${box.id}/archive`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(archiveRes.statusCode).toBe(200);
+    expect(archiveRes.json().data.status).toBe('ARCHIVED');
+
+    // Filter by status=ACTIVE and status=ARCHIVED
+    const activeList = await app.inject({
+      method: 'GET',
+      url: '/api/v1/units-of-measure?status=ACTIVE',
+      headers: { cookie },
+    });
+    expect(activeList.statusCode).toBe(200);
+    expect(activeList.json().data.map((u: { id: string }) => u.id)).toEqual([pack.id]);
+
+    const archivedList = await app.inject({
+      method: 'GET',
+      url: '/api/v1/units-of-measure?status=ARCHIVED',
+      headers: { cookie },
+    });
+    expect(archivedList.statusCode).toBe(200);
+    expect(archivedList.json().data.map((u: { id: string }) => u.id)).toEqual([box.id]);
+
+    // Unarchive box
+    const unarchiveRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/units-of-measure/${box.id}/unarchive`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(unarchiveRes.statusCode).toBe(200);
+    expect(unarchiveRes.json().data.status).toBe('ACTIVE');
+
+    const events = await db.select().from(outboxEvents).orderBy(desc(outboxEvents.seqId));
+    const eventTypes = events.map((e) => e.eventType);
+    expect(eventTypes).toContain('UnitOfMeasureUpdated');
+    expect(eventTypes).toContain('UnitOfMeasureArchived');
+    expect(eventTypes).toContain('UnitOfMeasureUnarchived');
+  });
+
   it('supports Products CRUD, status filtering, archive/unarchive, and delete protection', async () => {
     const { app, cookie } = await setupAuthedApp();
 

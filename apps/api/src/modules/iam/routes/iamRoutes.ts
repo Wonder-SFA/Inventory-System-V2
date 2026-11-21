@@ -83,7 +83,7 @@ export function registerIamRoutes(
   });
 
   // Enforce Better Auth session + iam Access Switch on all /api/v1/* routes
-  app.addHook('preHandler', async (request) => {
+  app.addHook('onRequest', async (request) => {
     const path = request.url.split('?')[0] ?? request.url;
     if (!path.startsWith('/api/v1/')) {
       return;

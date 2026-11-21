@@ -74,20 +74,23 @@ export function buildApp(deps: AppDeps = {}): FastifyInstance {
   }
 
   if (deps.db) {
-    const auth = createAuth(deps.db, { nodeEnv });
+    const db = deps.db;
+    const auth = createAuth(db, { nodeEnv });
     const sseBroadcaster = deps.sseBroadcaster ?? new SseBroadcaster();
     if (deps.outboxDispatcher) {
       sseBroadcaster.registerWithDispatcher(deps.outboxDispatcher);
     }
 
-    registerIamRoutes(app, { db: deps.db, auth });
-    registerSseRoutes(app, { broadcaster: sseBroadcaster });
-    registerInventoryRoutes(app, {
-      db: deps.db,
-      outboxDispatcher: deps.outboxDispatcher,
+    app.after(() => {
+      registerIamRoutes(app, { db, auth });
+      registerSseRoutes(app, { broadcaster: sseBroadcaster });
+      registerInventoryRoutes(app, {
+        db,
+        outboxDispatcher: deps.outboxDispatcher,
+      });
+      registerCatalogRoutes(app, { db, outboxDispatcher: deps.outboxDispatcher });
+      registerOrdersRoutes(app, { db, outboxDispatcher: deps.outboxDispatcher });
     });
-    registerCatalogRoutes(app, { db: deps.db, outboxDispatcher: deps.outboxDispatcher });
-    registerOrdersRoutes(app, { db: deps.db, outboxDispatcher: deps.outboxDispatcher });
   }
 
   app.get('/health', async () => {
