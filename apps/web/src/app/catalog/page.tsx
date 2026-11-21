@@ -1,8 +1,15 @@
 'use client';
 
-import type { CatalogStatus, Product, Sku, UnitOfMeasure } from '@iv2/shared-domain';
+import {
+  type CatalogStatus,
+  type Product,
+  SSE_TOPICS,
+  type Sku,
+  type UnitOfMeasure,
+} from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
+import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 type CatalogTab = 'skus' | 'products' | 'units';
@@ -106,6 +113,8 @@ export default function CatalogPage() {
   useEffect(() => {
     void refreshAll();
   }, [refreshAll]);
+
+  useLiveRefresh([SSE_TOPICS.CATALOG], refreshAll);
 
   // Unit of Measure handlers
   async function handleCreateUnit(e: FormEvent) {

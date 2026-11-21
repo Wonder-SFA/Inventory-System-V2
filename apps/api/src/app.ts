@@ -26,11 +26,13 @@ import {
   registerRateLimiting,
 } from './shared/http/index.js';
 import type { OutboxDispatcher } from './shared/outbox/index.js';
+import { SseBroadcaster, registerSseRoutes } from './shared/sse/index.js';
 
 export interface AppDeps {
   pool?: Pool | undefined;
   db?: Database | undefined;
   outboxDispatcher?: OutboxDispatcher | undefined;
+  sseBroadcaster?: SseBroadcaster | undefined;
   nodeEnv?: string | undefined;
   rateLimit?: RateLimitOptions | undefined;
 }
@@ -73,7 +75,13 @@ export function buildApp(deps: AppDeps = {}): FastifyInstance {
 
   if (deps.db) {
     const auth = createAuth(deps.db, { nodeEnv });
+    const sseBroadcaster = deps.sseBroadcaster ?? new SseBroadcaster();
+    if (deps.outboxDispatcher) {
+      sseBroadcaster.registerWithDispatcher(deps.outboxDispatcher);
+    }
+
     registerIamRoutes(app, { db: deps.db, auth });
+    registerSseRoutes(app, { broadcaster: sseBroadcaster });
     registerInventoryRoutes(app, {
       db: deps.db,
       outboxDispatcher: deps.outboxDispatcher,

@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { type ReactNode, useEffect, useState } from 'react';
 import { type SessionInfo, fetchSession } from '../lib/api-client';
+import { LiveInvalidationProvider } from './LiveInvalidationProvider';
 
 const NAV_ITEMS = [
   { href: '/catalog', label: 'Catalog' },
@@ -127,7 +128,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         )}
 
-        <main className="main-content">{children}</main>
+        {session.accessSwitch === 'SUSPENDED' ? (
+          <main className="main-content">{children}</main>
+        ) : (
+          <LiveInvalidationProvider>
+            <main className="main-content">{children}</main>
+          </LiveInvalidationProvider>
+        )}
       </div>
     </div>
   );
