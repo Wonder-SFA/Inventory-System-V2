@@ -39,14 +39,13 @@ describe('database schema migrations', () => {
     const migrations = await pool.query<{ id: string }>(
       'SELECT id FROM shared._migrations ORDER BY id ASC;',
     );
-    expect(migrations.rows.map((r) => r.id)).toEqual(
-      expect.arrayContaining([
-        '0001_init_schemas.sql',
-        '0002_shared_outbox_idempotency.sql',
-        '0003_iam_auth_and_access_switch.sql',
-        '0005_inventory_locations.sql',
-      ]),
-    );
+    expect(migrations.rows.map((r) => r.id)).toEqual([
+      '0001_init_schemas.sql',
+      '0002_shared_outbox_idempotency.sql',
+      '0003_iam_auth_and_access_switch.sql',
+      '0004_catalog_schema.sql',
+      '0005_inventory_locations.sql',
+    ]);
 
     const tables = await pool.query<{ table_name: string }>(
       `
