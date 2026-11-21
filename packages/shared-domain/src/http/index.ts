@@ -13,6 +13,7 @@ export const ERROR_CODES = {
   ACCESS_READ_ONLY: 'ACCESS_READ_ONLY',
   ACCESS_SUSPENDED: 'ACCESS_SUSPENDED',
   RATE_LIMITED: 'RATE_LIMITED',
+  TOO_MANY_SSE_CONNECTIONS: 'TOO_MANY_SSE_CONNECTIONS',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
   STALE_VERSION: 'STALE_VERSION',
@@ -174,7 +175,10 @@ export class ValidationError extends DomainError {
 }
 
 export class RateLimitedError extends DomainError {
-  constructor(message = 'Rate limit exceeded') {
-    super(429, ERROR_CODES.RATE_LIMITED, message);
+  constructor(
+    message = 'Rate limit exceeded',
+    code: ErrorCode = ERROR_CODES.RATE_LIMITED,
+  ) {
+    super(429, code, message);
   }
 }

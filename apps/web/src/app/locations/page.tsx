@@ -1,8 +1,9 @@
 'use client';
 
-import type { Location, LocationStatus } from '@iv2/shared-domain';
+import { type Location, type LocationStatus, SSE_TOPICS } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
+import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 type StatusFilter = 'ALL' | LocationStatus;
@@ -75,6 +76,8 @@ export default function LocationsPage() {
       active = false;
     };
   }, [statusFilter, loadLocations]);
+
+  useLiveRefresh([SSE_TOPICS.LOCATIONS], () => loadLocations(statusFilter));
 
   function resetForm() {
     setEditingId(null);

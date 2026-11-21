@@ -1,8 +1,15 @@
 'use client';
 
-import type { Location, Sku, StockMovement, StockMovementType } from '@iv2/shared-domain';
+import {
+  type Location,
+  SSE_TOPICS,
+  type Sku,
+  type StockMovement,
+  type StockMovementType,
+} from '@iv2/shared-domain';
 import { useCallback, useEffect, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
+import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { apiFetchPaginated } from '../../lib/api-client';
 
 const MOVEMENT_TYPES: StockMovementType[] = [
@@ -93,6 +100,11 @@ export default function StockMovementsPage() {
       active = false;
     };
   }, [skuId, locationId, movementType, loadMovements]);
+
+  useLiveRefresh(
+    [SSE_TOPICS.STOCK_MOVEMENTS, SSE_TOPICS.LOCATIONS, SSE_TOPICS.CATALOG],
+    () => loadMovements(skuId, locationId, movementType),
+  );
 
   async function handleLoadMore() {
     if (!nextCursor) return;

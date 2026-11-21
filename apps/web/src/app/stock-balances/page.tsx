@@ -1,15 +1,17 @@
 'use client';
 
-import type {
-  AdjustmentReasonCategory,
-  Location,
-  Sku,
-  StockBalance,
-  StockBalanceView,
-  StockMovement,
+import {
+  type AdjustmentReasonCategory,
+  type Location,
+  SSE_TOPICS,
+  type Sku,
+  type StockBalance,
+  type StockBalanceView,
+  type StockMovement,
 } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
+import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 const REASON_CATEGORIES: { value: AdjustmentReasonCategory; label: string }[] = [
@@ -125,6 +127,11 @@ export default function StockBalancesPage() {
       active = false;
     };
   }, [view, locationId, zeroOrNegativeOnly, loadBalances]);
+
+  useLiveRefresh(
+    [SSE_TOPICS.STOCK_BALANCES, SSE_TOPICS.LOCATIONS, SSE_TOPICS.CATALOG],
+    () => loadBalances(view, locationId, zeroOrNegativeOnly),
+  );
 
   const summary = useMemo(() => {
     let totalInventoryValue = 0;
