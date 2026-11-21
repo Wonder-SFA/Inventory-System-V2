@@ -6,6 +6,7 @@ import { registerCustomerRoutes } from './customerRoutes.js';
 import { registerPurchaseOrderRoutes } from './purchaseOrderRoutes.js';
 import { registerSalesOrderRoutes } from './salesOrderRoutes.js';
 import { registerSupplierRoutes } from './supplierRoutes.js';
+import { registerTransferOrderRoutes } from './transferOrderRoutes.js';
 
 export interface RegisterOrdersRoutesOptions {
   db: Database;
@@ -21,4 +22,5 @@ export function registerOrdersRoutes(
   registerPurchaseOrderRoutes(app, options);
   registerCustomerRoutes(app, options);
   registerSalesOrderRoutes(app, options);
+  registerTransferOrderRoutes(app, options);
 }
