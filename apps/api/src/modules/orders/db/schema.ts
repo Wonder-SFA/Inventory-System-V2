@@ -1,9 +1,11 @@
 import { ordersSchema } from '@iv2/db';
 import type {
   CustomerStatus,
+  DiscrepancyReason,
   PurchaseOrderStatus,
   SalesOrderStatus,
   SupplierStatus,
+  TransferOrderStatus,
 } from '@iv2/shared-domain';
 import { char, index, integer, numeric, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
@@ -141,3 +143,54 @@ export const salesOrderLines = ordersSchema.table(
 
 export type SalesOrderLineRow = typeof salesOrderLines.$inferSelect;
 export type NewSalesOrderLineRow = typeof salesOrderLines.$inferInsert;
+
+export const transferOrders = ordersSchema.table(
+  'transfer_orders',
+  {
+    id: uuid('id').primaryKey(),
+    orderNumber: text('order_number').notNull().unique(),
+    sourceLocationId: uuid('source_location_id').notNull(),
+    destinationLocationId: uuid('destination_location_id').notNull(),
+    status: text('status').$type<TransferOrderStatus>().notNull().default('DRAFT'),
+    version: integer('version').notNull().default(1),
+    note: text('note'),
+    discrepancyReason: text('discrepancy_reason').$type<DiscrepancyReason>(),
+    discrepancyNote: text('discrepancy_note'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('orders_transfer_orders_status_created_idx').on(table.status, table.createdAt),
+    index('orders_transfer_orders_source_status_idx').on(table.sourceLocationId, table.status),
+    index('orders_transfer_orders_dest_status_idx').on(table.destinationLocationId, table.status),
+    index('orders_transfer_orders_created_id_idx').on(table.createdAt, table.id),
+  ],
+);
+
+export type TransferOrderRow = typeof transferOrders.$inferSelect;
+export type NewTransferOrderRow = typeof transferOrders.$inferInsert;
+
+export const transferOrderLines = ordersSchema.table(
+  'transfer_order_lines',
+  {
+    id: uuid('id').primaryKey(),
+    transferOrderId: uuid('transfer_order_id')
+      .notNull()
+      .references(() => transferOrders.id, { onDelete: 'cascade' }),
+    skuId: uuid('sku_id').notNull(),
+    orderedQty: numeric('ordered_qty', { precision: 18, scale: 4 }).notNull(),
+    dispatchedQty: numeric('dispatched_qty', { precision: 18, scale: 4 }).notNull().default('0.0000'),
+    receivedQty: numeric('received_qty', { precision: 18, scale: 4 }).notNull().default('0.0000'),
+    dispatchUnitCost: numeric('dispatch_unit_cost', { precision: 18, scale: 4 }),
+    currency: char('currency', { length: 3 }).notNull().default('USD'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('orders_transfer_order_lines_to_idx').on(table.transferOrderId),
+    index('orders_transfer_order_lines_sku_idx').on(table.skuId),
+  ],
+);
+
+export type TransferOrderLineRow = typeof transferOrderLines.$inferSelect;
+export type NewTransferOrderLineRow = typeof transferOrderLines.$inferInsert;

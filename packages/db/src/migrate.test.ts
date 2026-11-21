@@ -48,6 +48,7 @@ describe('database schema migrations', () => {
       '0006_inventory_ledger_and_balances.sql',
       '0007_orders_suppliers_purchase_orders.sql',
       '0008_orders_customers_sales_orders.sql',
+      '0009_orders_transfer_orders.sql',
     ]);
 
     const tables = await pool.query<{ table_name: string }>(

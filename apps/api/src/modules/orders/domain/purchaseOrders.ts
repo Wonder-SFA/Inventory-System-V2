@@ -23,7 +23,7 @@ import {
   toUnitCost,
   uuidv7,
 } from '@iv2/shared-domain';
-import { type SQL, and, asc, eq, inArray } from 'drizzle-orm';
+import { type SQL, and, asc, eq, inArray, or } from 'drizzle-orm';
 import {
   type DbTransaction,
   type DomainEventInput,
@@ -47,6 +47,8 @@ import {
   salesOrderLines,
   salesOrders,
   suppliers,
+  transferOrderLines,
+  transferOrders,
 } from '../db/index.js';
 import { getSupplierById } from './suppliers.js';
 
@@ -71,7 +73,15 @@ export async function hasOrderSkuReferences(
     .from(salesOrderLines)
     .where(eq(salesOrderLines.skuId, skuId))
     .limit(1);
-  return Boolean(soRef);
+  if (soRef) {
+    return true;
+  }
+  const [toRef] = await db
+    .select({ id: transferOrderLines.id })
+    .from(transferOrderLines)
+    .where(eq(transferOrderLines.skuId, skuId))
+    .limit(1);
+  return Boolean(toRef);
 }
 
 export async function hasOrderLocationReferences(
@@ -91,7 +101,20 @@ export async function hasOrderLocationReferences(
     .from(salesOrders)
     .where(eq(salesOrders.locationId, locationId))
     .limit(1);
-  return Boolean(soRef);
+  if (soRef) {
+    return true;
+  }
+  const [toRef] = await db
+    .select({ id: transferOrders.id })
+    .from(transferOrders)
+    .where(
+      or(
+        eq(transferOrders.sourceLocationId, locationId),
+        eq(transferOrders.destinationLocationId, locationId),
+      ),
+    )
+    .limit(1);
+  return Boolean(toRef);
 }
 
 export function registerOrdersReferenceCheckers(): void {

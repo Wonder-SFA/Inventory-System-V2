@@ -559,3 +559,224 @@ export const ReturnSalesOrderResultSchema = z.object({
   movements: z.array(StockMovementSchema),
 });
 export type ReturnSalesOrderResult = z.infer<typeof ReturnSalesOrderResultSchema>;
+
+export const TransferOrderStatusSchema = z.enum([
+  'DRAFT',
+  'CONFIRMED',
+  'IN_TRANSIT',
+  'PARTIALLY_RECEIVED',
+  'RECEIVED',
+  'CLOSED_WITH_DISCREPANCY',
+  'CANCELLED',
+]);
+export type TransferOrderStatus = z.infer<typeof TransferOrderStatusSchema>;
+
+export const DiscrepancyReasonSchema = z.enum(['LOST', 'DAMAGED', 'OTHER']);
+export type DiscrepancyReason = z.infer<typeof DiscrepancyReasonSchema>;
+
+export interface TransferOrderLine {
+  id: string;
+  transferOrderId: string;
+  skuId: string;
+  skuCode?: string | undefined;
+  skuName?: string | undefined;
+  orderedQty: Quantity;
+  dispatchedQty: Quantity;
+  receivedQty: Quantity;
+  dispatchUnitCost?: UnitCost | null | undefined;
+  currency: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const TransferOrderLineSchema: z.ZodType<TransferOrderLine, z.ZodTypeDef, unknown> =
+  z.object({
+    id: z.string().uuid(),
+    transferOrderId: z.string().uuid(),
+    skuId: z.string().uuid(),
+    skuCode: z.string().optional(),
+    skuName: z.string().optional(),
+    orderedQty: zQuantity,
+    dispatchedQty: zQuantity,
+    receivedQty: zQuantity,
+    dispatchUnitCost: zUnitCost.nullable().optional(),
+    currency: z.string().length(3),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  });
+
+export interface TransferOrder {
+  id: string;
+  orderNumber: string;
+  sourceLocationId: string;
+  sourceLocationName?: string | undefined;
+  destinationLocationId: string;
+  destinationLocationName?: string | undefined;
+  status: TransferOrderStatus;
+  version: number;
+  note: string | null;
+  discrepancyReason: DiscrepancyReason | null;
+  discrepancyNote: string | null;
+  lines: TransferOrderLine[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const TransferOrderSchema: z.ZodType<TransferOrder, z.ZodTypeDef, unknown> = z.object({
+  id: z.string().uuid(),
+  orderNumber: z.string().min(1),
+  sourceLocationId: z.string().uuid(),
+  sourceLocationName: z.string().optional(),
+  destinationLocationId: z.string().uuid(),
+  destinationLocationName: z.string().optional(),
+  status: TransferOrderStatusSchema,
+  version: z.number().int().min(1),
+  note: z.string().nullable(),
+  discrepancyReason: DiscrepancyReasonSchema.nullable(),
+  discrepancyNote: z.string().nullable(),
+  lines: z.array(TransferOrderLineSchema),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+export interface TransferOrderLineInput {
+  skuId: string;
+  orderedQty: Quantity;
+}
+
+export interface TransferOrderLineRawInput {
+  skuId: string;
+  orderedQty: string;
+}
+
+export const TransferOrderLineInputSchema: z.ZodType<
+  TransferOrderLineInput,
+  z.ZodTypeDef,
+  TransferOrderLineRawInput
+> = z.object({
+  skuId: z.string().uuid(),
+  orderedQty: zQuantity.refine((val) => isPositive(val), {
+    message: 'Ordered quantity must be greater than zero',
+  }),
+});
+
+export interface CreateTransferOrderInput {
+  orderNumber?: string | undefined;
+  sourceLocationId: string;
+  destinationLocationId: string;
+  note?: string | null | undefined;
+  lines: TransferOrderLineInput[];
+}
+
+export interface CreateTransferOrderRawInput {
+  orderNumber?: string | undefined;
+  sourceLocationId: string;
+  destinationLocationId: string;
+  note?: string | null | undefined;
+  lines: TransferOrderLineRawInput[];
+}
+
+export const CreateTransferOrderInputSchema: z.ZodType<
+  CreateTransferOrderInput,
+  z.ZodTypeDef,
+  CreateTransferOrderRawInput
+> = z.object({
+  orderNumber: z.string().trim().min(1).max(64).optional(),
+  sourceLocationId: z.string().uuid(),
+  destinationLocationId: z.string().uuid(),
+  note: z.string().trim().max(1000).nullable().optional(),
+  lines: z.array(TransferOrderLineInputSchema).min(1).max(500),
+});
+
+export interface UpdateTransferOrderInput {
+  expectedVersion: number;
+  sourceLocationId?: string | undefined;
+  destinationLocationId?: string | undefined;
+  note?: string | null | undefined;
+  lines?: TransferOrderLineInput[] | undefined;
+}
+
+export interface UpdateTransferOrderRawInput {
+  expectedVersion: number;
+  sourceLocationId?: string | undefined;
+  destinationLocationId?: string | undefined;
+  note?: string | null | undefined;
+  lines?: TransferOrderLineRawInput[] | undefined;
+}
+
+export const UpdateTransferOrderInputSchema: z.ZodType<
+  UpdateTransferOrderInput,
+  z.ZodTypeDef,
+  UpdateTransferOrderRawInput
+> = z.object({
+  expectedVersion: z.number().int().min(1),
+  sourceLocationId: z.string().uuid().optional(),
+  destinationLocationId: z.string().uuid().optional(),
+  note: z.string().trim().max(1000).nullable().optional(),
+  lines: z.array(TransferOrderLineInputSchema).min(1).max(500).optional(),
+});
+
+export const ListTransferOrdersQuerySchema = CursorPaginationQuerySchema.extend({
+  status: TransferOrderStatusSchema.optional(),
+  sourceLocationId: z.string().uuid().optional(),
+  destinationLocationId: z.string().uuid().optional(),
+});
+export type ListTransferOrdersQuery = z.infer<typeof ListTransferOrdersQuerySchema>;
+
+export const DispatchTransferOrderInputSchema = z.object({
+  note: z.string().trim().max(1000).nullable().optional(),
+});
+export type DispatchTransferOrderInput = z.infer<typeof DispatchTransferOrderInputSchema>;
+
+export interface ReceiveTransferOrderLineInput {
+  orderLineId: string;
+  quantity: Quantity;
+}
+
+export interface ReceiveTransferOrderLineRawInput {
+  orderLineId: string;
+  quantity: string;
+}
+
+export const ReceiveTransferOrderLineInputSchema: z.ZodType<
+  ReceiveTransferOrderLineInput,
+  z.ZodTypeDef,
+  ReceiveTransferOrderLineRawInput
+> = z.object({
+  orderLineId: z.string().uuid(),
+  quantity: zQuantity.refine((val) => isPositive(val), {
+    message: 'Receive quantity must be greater than zero',
+  }),
+});
+
+export interface ReceiveTransferOrderInput {
+  note?: string | null | undefined;
+  lines: ReceiveTransferOrderLineInput[];
+}
+
+export interface ReceiveTransferOrderRawInput {
+  note?: string | null | undefined;
+  lines: ReceiveTransferOrderLineRawInput[];
+}
+
+export const ReceiveTransferOrderInputSchema: z.ZodType<
+  ReceiveTransferOrderInput,
+  z.ZodTypeDef,
+  ReceiveTransferOrderRawInput
+> = z.object({
+  note: z.string().trim().max(1000).nullable().optional(),
+  lines: z.array(ReceiveTransferOrderLineInputSchema).min(1).max(500),
+});
+
+export const ReceiveTransferOrderResultSchema = z.object({
+  transferOrderId: z.string().uuid(),
+  status: TransferOrderStatusSchema,
+  movements: z.array(StockMovementSchema),
+});
+export type ReceiveTransferOrderResult = z.infer<typeof ReceiveTransferOrderResultSchema>;
+
+export const CloseTransferDiscrepancyInputSchema = z.object({
+  reason: DiscrepancyReasonSchema,
+  note: z.string().trim().min(1, 'Discrepancy note is required').max(1000),
+});
+export type CloseTransferDiscrepancyInput = z.infer<typeof CloseTransferDiscrepancyInputSchema>;
