@@ -2,7 +2,9 @@ import type { Database } from '@iv2/db';
 import type { FastifyInstance } from 'fastify';
 import type { OutboxDispatcher } from '../../../shared/index.js';
 import { registerOrdersReferenceCheckers } from '../domain/index.js';
+import { registerCustomerRoutes } from './customerRoutes.js';
 import { registerPurchaseOrderRoutes } from './purchaseOrderRoutes.js';
+import { registerSalesOrderRoutes } from './salesOrderRoutes.js';
 import { registerSupplierRoutes } from './supplierRoutes.js';
 
 export interface RegisterOrdersRoutesOptions {
@@ -17,4 +19,6 @@ export function registerOrdersRoutes(
   registerOrdersReferenceCheckers();
   registerSupplierRoutes(app, options);
   registerPurchaseOrderRoutes(app, options);
+  registerCustomerRoutes(app, options);
+  registerSalesOrderRoutes(app, options);
 }

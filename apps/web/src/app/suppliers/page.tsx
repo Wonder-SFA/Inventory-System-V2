@@ -1,8 +1,9 @@
 'use client';
 
-import type { Supplier, SupplierStatus } from '@iv2/shared-domain';
+import { SSE_TOPICS, type Supplier, type SupplierStatus } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
+import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 type StatusFilter = 'ALL' | SupplierStatus;
@@ -64,6 +65,8 @@ export default function SuppliersPage() {
       active = false;
     };
   }, [statusFilter, loadSuppliers]);
+
+  useLiveRefresh([SSE_TOPICS.SUPPLIERS], () => loadSuppliers(statusFilter));
 
   function resetForm() {
     setEditingId(null);
