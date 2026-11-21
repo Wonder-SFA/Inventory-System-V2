@@ -58,7 +58,7 @@ inventory-system-v2/
 │   └── db/                           # Shared PostgreSQL connection, Drizzle config, per-schema migrations
 ├── docs/
 │   ├── ARCHITECTURE_BLUEPRINT.md     # This blueprint
-│   ├── adr/                          # Architecture Decision Records (to be finalized in /domain-modeling)
+│   ├── adr/                          # 7 accepted Architecture Decision Records + index
 │   └── wayfinder/                    # Planning map & decision tickets (001–011)
 ├── GLOSSARY.md                       # Shared plain-English domain vocabulary
 ├── package.json
@@ -143,19 +143,15 @@ Because future features live in isolated boxes behind Phase 1's extension points
 
 ---
 
-## 6. Next Step: Handoff to `/domain-modeling` (Glossary & ADRs)
+## 6. Domain Glossary & Architecture Decision Records
 
-Now that the Wayfinder Map is complete, use a dedicated `/domain-modeling` session to finalize the permanent domain dictionary and architecture decision records:
-
-1. **Final `GLOSSARY.md` Review:**
-   - Verify existing Phase 1 terms and evaluate new business terms introduced in Tickets 006–010 (for example: `Weighted Average Cost`, `Manager Exception`, `Quick Counter Sale`, `Cash Balance`, `IAM Audit Log`).
-   - Keep `GLOSSARY.md` strictly in plain business English with zero implementation details.
-2. **Create Key ADRs (`docs/adr/`):**
-   Record only hard-to-reverse decisions that represent real trade-offs and would surprise a future reader without context—such as:
-   - Modular Monolith with Isolated PostgreSQL Schemas (vs. microservices or single shared schema)
-   - Append-Only Stock Ledger + Projected Stock Balances + Transactional Outbox
-   - TypeScript Monorepo (`pnpm` + Turborepo), Fastify, Drizzle ORM, and Better Auth
-   - Flexible Negative Stock Policy (Warning + Marker in Phase 1; Permission-Gated in Phase 2)
-   - Weighted Average Cost Stored Per-Location (with Company-Wide View Toggle)
-   - Offline-First Mobile Sync: Physical Reality Wins + Manager Exceptions
-   - Containerized Managed Cloud Deployment Portable to Google Cloud (Cloud Run + Cloud SQL)
+1. **Shared Domain Vocabulary ([GLOSSARY.md](../GLOSSARY.md)):**
+   Plain-English definitions and "avoid" terms covering Catalog, Locations & Stock, Orders & Counterparties (including `Quick Counter Sale`), Finance & Valuation (`Weighted Average Cost`, `Cash Balance`), and Operations & Governance (`Manager Exception`, `IAM Audit Log`).
+2. **Architecture Decision Records ([docs/adr/README.md](./adr/README.md)):**
+   - [ADR-0001: Modular Monolith & Isolated PostgreSQL Schemas](./adr/0001-modular-monolith-and-schema-isolation.md)
+   - [ADR-0002: Append-Only Stock Ledger & Transactional Outbox](./adr/0002-append-only-stock-ledger-and-outbox.md)
+   - [ADR-0003: TypeScript Monorepo & Core Stack](./adr/0003-typescript-monorepo-and-core-stack.md)
+   - [ADR-0004: Flexible Negative Stock Policy](./adr/0004-flexible-negative-stock-policy.md)
+   - [ADR-0005: Per-Location Weighted Average Cost](./adr/0005-per-location-weighted-average-cost.md)
+   - [ADR-0006: Offline Mobile Sync — Physical Reality Wins & Manager Exceptions](./adr/0006-offline-mobile-physical-reality-wins.md)
+   - [ADR-0007: Portable Containerized Cloud Hosting](./adr/0007-portable-containerized-cloud-hosting.md)

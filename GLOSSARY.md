@@ -65,3 +65,27 @@ _Avoid_: SO, Customer Order, Outbound Order
 **Transfer Order**:
 An internal order to move specific SKUs from one Location to another, tracking stock through an In-Transit state between dispatch and receipt.
 _Avoid_: Stock Move Request, Internal Order
+
+**Quick Counter Sale**:
+A single-step walk-in sale recorded over the counter that immediately deducts On-Hand Stock at a Location and records cash payment, skipping Draft, Reservation, and Shipping steps.
+_Avoid_: POS Sale, Register Ring, Walk-in Order
+
+### Finance & Valuation
+
+**Weighted Average Cost**:
+The per-unit value of a SKU's On-Hand Stock at a Location, recalculated as the total value of stock on hand plus newly received stock divided by the new total quantity.
+_Avoid_: Unit Price, FIFO Cost, Standard Cost
+
+**Cash Balance**:
+The business's real cash on hand, updated when Purchase Orders, Sales Orders, Quick Counter Sales, or manual income and expense entries are marked paid.
+_Avoid_: Revenue, Profit, Bank Feed
+
+### Operations & Governance
+
+**Manager Exception**:
+A flagged discrepancy created when a physical warehouse action recorded offline clashes with server state upon reconnect (such as an order cancelled at the office or stock dipping negative), requiring manager follow-up without rejecting the physical movement.
+_Avoid_: Sync Error, Conflict Failure, Rejected Scan
+
+**IAM Audit Log**:
+An immutable historical record of every role creation, permission edit, approval limit change, and user-to-Location assignment change.
+_Avoid_: Activity Feed, System Log, Access History
