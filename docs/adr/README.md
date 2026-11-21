@@ -13,6 +13,7 @@ This directory contains the Architecture Decision Records (ADRs) for Inventory S
 | [0005](./0005-per-location-weighted-average-cost.md) | Per-Location Weighted Average Cost | Accepted | 2026-11-21 |
 | [0006](./0006-offline-mobile-physical-reality-wins.md) | Offline Mobile Sync — Physical Reality Wins & Manager Exceptions | Accepted | 2026-11-21 |
 | [0007](./0007-portable-containerized-cloud-hosting.md) | Portable Containerized Cloud Hosting | Accepted | 2026-11-21 |
+| [0008](./0008-rest-api-contract-idempotency-and-sse.md) | REST API Contract, Multi-Line Idempotency & Invalidation SSE | Accepted | 2026-11-21 |
 
 ## ADR Lifecycle Rules
 

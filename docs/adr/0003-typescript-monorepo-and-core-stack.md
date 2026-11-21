@@ -20,9 +20,10 @@ Inventory System V2 needs a desktop web application in Phases 1–3, a standalon
 
 We will standardize on a **TypeScript monorepo (`pnpm` workspaces + Turborepo)** with:
 - **Frontend Web (`apps/web`):** Next.js / React.
-- **Backend API (`apps/api`):** **Fastify** (lightweight, fast standalone server that cleanly serves the web app, SSE live streams, and the future React Native / Expo mobile app).
-- **Database & ORM:** **PostgreSQL + Drizzle ORM** (stays close to SQL for predictable multi-schema tables, row locking, and transactional outbox writes).
-- **Authentication:** **Better Auth** backed directly by PostgreSQL sessions (free, works for web and mobile, and naturally extends into Phase 2 `iam` roles, Location scoping, and the `authorize(actor, action, resource)` gate).
+- **Backend API (`apps/api`):** **Fastify** (lightweight, fast standalone server exposing versioned REST + JSON under `/api/v1/*` validated with Zod in `packages/shared-domain` via `fastify-type-provider-zod` + `@fastify/swagger` OpenAPI 3.1 per [ADR-0008](./0008-rest-api-contract-idempotency-and-sse.md) to cleanly serve the web app, SSE live streams, and the future React Native / Expo mobile app).
+- **Database & ORM:** **PostgreSQL + Drizzle ORM** (stays close to SQL for predictable multi-schema tables via `pgSchema('<module>')` + `schemaFilter` in `drizzle.config.ts`, row locking, and transactional outbox writes). All domain entities use **`UUIDv7`** primary keys and **`TIMESTAMPTZ`** (UTC) timestamps.
+- **Exact Numeric Precision:** Quantities and money standardize on **`NUMERIC(18, 4)`** in `packages/db`, represented in TypeScript as decimal strings and computed via a fixed-precision decimal library in `packages/shared-domain` (never JavaScript `number` floats), backed by a strict UI & API validation guardrail rejecting inputs with more than 4 decimal places.
+- **Authentication:** **Better Auth** with its Drizzle adapter explicitly mapped to `iam.*` tables inside the single Drizzle migration pipeline (same-origin `/api/*` Next.js proxy with `HttpOnly`, `SameSite=Lax` cookies for Web, Bearer tokens for Phase 4 mobile, and natural extension into Phase 2 `iam` roles, Location scoping, and the `authorize(actor, action, resource)` gate).
 
 ## Consequences
 
@@ -35,3 +36,4 @@ We will standardize on a **TypeScript monorepo (`pnpm` workspaces + Turborepo)**
 
 - [ADR-0001: Modular Monolith & Isolated PostgreSQL Schemas](./0001-modular-monolith-and-schema-isolation.md)
 - [ADR-0007: Portable Containerized Cloud Hosting](./0007-portable-containerized-cloud-hosting.md)
+- [ADR-0008: REST API Contract, Multi-Line Idempotency & Invalidation SSE](./0008-rest-api-contract-idempotency-and-sse.md)

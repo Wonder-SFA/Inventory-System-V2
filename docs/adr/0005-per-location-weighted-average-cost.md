@@ -5,7 +5,7 @@
 
 ## Context
 
-Phase 3 Reporting & Analytics introduces Inventory Valuation. Different Locations may acquire stock at different landed/purchase costs or receive stock via internal Transfer Orders. Additionally, if Phase 1 does not capture purchase costs on receipts, Phase 3 would require painful historical cost backfilling.
+Inventory System V2 includes **full cost and profit tracking from Phase 1** (moved forward from Phase 3 so unit costs, per-location valuation, and margins are accurate from day one without historical backfilling). Different Locations may acquire stock at different landed/purchase costs or receive stock via internal Transfer Orders.
 
 ## Options Considered
 
@@ -17,10 +17,13 @@ Phase 3 Reporting & Analytics introduces Inventory Valuation. Different Location
 
 ## Decision & Rationale
 
-We will value On-Hand Stock using **Weighted Average Cost stored per Location**, supported by two rules:
+We will value On-Hand Stock using **Weighted Average Cost stored per Location** starting in **Phase 1**, supported by three rules:
 
-1. **Optional `unitCost` from Phase 1:** Purchase Order lines and `RECEIPT` stock movements accept an optional `unitCost` and currency starting in Phase 1 so Phase 3 has clean historical cost data without backfilling.
-2. **Per-Location Storage + Company-Wide Toggle:** The `reporting` module stores and updates Weighted Average Cost per `(skuId, locationId)`—so internal Transfer Orders carry the sending Location's cost—while offering a UI toggle to view either **Per-Location** or **Company-wide** average cost, plus hover formula popovers showing the exact calculation. Access to dollar cost columns is gated by `iam`'s `View Costs & Prices` permission.
+1. **Active Cost & Precision Tracking from Phase 1:** Purchase Order lines and `RECEIPT` stock movements capture `unit_cost` (`NUMERIC(18, 4)`) and `currency` (`CHAR(3)`) in Phase 1, with full cost, valuation, and profit tracking active from day one. All cost and quantity math is encapsulated inside the `Decimal4` value module (`Quantity`, `UnitCost`, `Money`, and pure `calculateWeightedAverageCost()`) in `packages/shared-domain` (never raw string comparisons or JS floats, per [MODULE_SEAMS.md](../MODULE_SEAMS.md)), backed by UI & API validation rejecting inputs exceeding 4 decimal places.
+2. **Negative-Stock WAC Guardrail:**
+   - When `oldQty <= 0` and `newQty > 0`: reset WAC to the incoming `unitCost`.
+   - When `newQty <= 0`: preserve `lastKnownWac` (never divide by zero or a negative quantity) and visibly flag any `<= 0` row on the Valuation Report as `"Estimated — Negative Stock"` until reconciled.
+3. **Per-Location Storage + Company-Wide Toggle:** Weighted Average Cost is stored and updated per `(skuId, locationId)`—and `Transfer Order` dispatch (`dispatchTransfer` in `inventory/public`) snapshots the sending Location's `Weighted Average Cost` onto the `TRANSFER_OUT` dispatch record so `In-Transit Stock` preserves the exact dispatch cost even if the sending Location's WAC later changes—while offering a UI toggle to view either **Per-Location** or **Company-wide** average cost, plus hover formula popovers showing the exact calculation. Access to dollar cost columns is enforced centrally by `AccessPolicy.redactCosts()` (`View Costs & Prices` when RBAC activates in Phase 2).
 
 ## Consequences
 

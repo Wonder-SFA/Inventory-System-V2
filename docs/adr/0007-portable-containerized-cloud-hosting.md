@@ -5,7 +5,7 @@
 
 ## Context
 
-The business wants simple, low-maintenance, predictable cloud hosting for initial rollout (1–4 office computers in Phases 1–3, plus mobile devices in Phase 4), while preserving a planned future migration to **Google Cloud (Cloud Run + Cloud SQL)** if the system scales or expands into a multi-tenant SaaS offering.
+The business wants **$0-cost local hosting on an old computer during Phase 1 testing** (1–4 office computers) before moving to managed cloud hosting—and ultimately **Google Cloud (Cloud Run + Cloud SQL)**—in later phases as the system rolls out across production locations or expands into a multi-tenant SaaS offering.
 
 ## Options Considered
 
@@ -17,11 +17,12 @@ The business wants simple, low-maintenance, predictable cloud hosting for initia
 
 ## Decision & Rationale
 
-We will deploy the application initially on a **Managed Cloud Platform** (such as Railway or Render) paired with **Managed PostgreSQL** for automatic HTTPS, automated daily backups, and minimal server maintenance, while enforcing strict **Google Cloud portability**:
+We will run **Phase 1 locally on an old PC via Docker Compose** (with zero code differences from production), deferring **Managed Cloud Hosting / Google Cloud (Cloud Run + Cloud SQL)** to a later phase while enforcing strict **cloud portability** from day one:
 
-- Package `apps/api` and `apps/web` as **standard Docker containers**.
+- Package `apps/api` and `apps/web` as **standard Docker containers** alongside standard PostgreSQL.
 - Keep API application servers **stateless** (sessions live in PostgreSQL via Better Auth; background consumers read from the PostgreSQL outbox).
-- Rely strictly on **standard PostgreSQL** features and standard environment-variable configuration, with zero proprietary hosting lock-in.
+- **Live Screen Updates ("Tap on the Shoulder"):** Real-time UI updates use a lightweight invalidation-only SSE ping on `GET /api/v1/events/stream` (`seqId`, `topics`, `locationIds`, `skuIds` — zero quantities, costs, or PII; `: keepalive` every `25s`, max `5` streams/user) that triggers a quiet background data refetch (and one quiet refresh on reconnect after Wi-Fi drops, local PC reboots, or future Cloud Run recycles)—zero idle polling traffic and zero complex client-side event-replay state.
+- Rely strictly on **standard PostgreSQL** features and standard environment-variable configuration, with zero proprietary hosting lock-in, Fastify `trustProxy` enabled for Next.js / Cloud Run proxy hops, and unversioned `GET /health` & `GET /ready` container probes per [ADR-0008](./0008-rest-api-contract-idempotency-and-sse.md).
 
 ## Consequences
 
@@ -34,3 +35,4 @@ We will deploy the application initially on a **Managed Cloud Platform** (such a
 
 - [ADR-0001: Modular Monolith & Isolated PostgreSQL Schemas](./0001-modular-monolith-and-schema-isolation.md)
 - [ADR-0003: TypeScript Monorepo & Core Stack](./0003-typescript-monorepo-and-core-stack.md)
+- [ADR-0008: REST API Contract, Multi-Line Idempotency & Invalidation SSE](./0008-rest-api-contract-idempotency-and-sse.md)

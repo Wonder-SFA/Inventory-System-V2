@@ -19,7 +19,7 @@ In real warehouse and store operations, physical stock is sometimes sitting on t
 
 We will use a **flexible negative stock policy** enforced in two layers:
 
-1. **Phase 1 (Warning + Visible Marker):** Both `Available Stock` and `On-Hand Stock` are allowed to drop below zero. Whenever either hits `<= 0`, the system immediately warns the user and places a visible **Zero / Negative Stock** marker on that `(skuId, locationId)` record so it surfaces in follow-up reconciliation and the Low-Stock report.
+1. **Phase 1 (Warning + Visible Marker + Fast Exception Index):** Both `Available Stock` and `On-Hand Stock` are allowed to drop below zero. Whenever either hits `<= 0`, the system immediately warns the user and places a visible **Zero / Negative Stock** marker on that `(skuId, locationId)` record—backed by a partial index `stock_balances (location_id, sku_id) WHERE on_hand <= 0 OR available <= 0`—so it surfaces quickly in follow-up reconciliation and the Low-Stock report. While negative (`<= 0`), Weighted Average Cost preserves `lastKnownWac` and flags valuation rows as `"Estimated — Negative Stock"` per [ADR-0005](./0005-per-location-weighted-average-cost.md).
 2. **Phase 2 (Role-Gated Override):** The `Allow Negative Stock` permission checkbox in `iam` determines who can push stock below zero. Users without that permission are blocked; authorized users proceed with the warning and marker.
 
 ## Consequences

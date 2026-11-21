@@ -72,8 +72,10 @@ _Avoid_: POS Sale, Register Ring, Walk-in Order
 
 ### Finance & Valuation
 
+*(All quantities and monetary values use exact 4-decimal fixed precision (`NUMERIC(18, 4)`), rejecting user inputs with more than 4 decimal places.)*
+
 **Weighted Average Cost**:
-The per-unit value of a SKU's On-Hand Stock at a Location, recalculated as the total value of stock on hand plus newly received stock divided by the new total quantity.
+The per-unit value of a SKU's On-Hand Stock at a Location, recalculated as the total value of stock on hand plus newly received stock divided by the new total quantity. When stock recovers from zero or negative (`<= 0`) back into positive territory, cost resets to the incoming unit cost; while `On-Hand Stock` remains `<= 0`, the last known cost is preserved and flagged as `"Estimated — Negative Stock"` on Valuation Reports until reconciled.
 _Avoid_: Unit Price, FIFO Cost, Standard Cost
 
 **Cash Balance**:

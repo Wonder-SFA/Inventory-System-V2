@@ -28,7 +28,7 @@ We will design Phase 4 mobile scanning around an **offline-first queue where Phy
 - **Positive:** The ledger always matches what physically happened on the warehouse floor, even during network outages.
 - **Positive:** Pairs naturally with our append-only ledger (ADR-0002) and flexible negative stock policy (ADR-0004).
 - **Negative:** Managers must review and clear flagged exceptions when concurrent office edits collide with offline scans.
-- **Risks & Mitigations:** Duplicate tap/retry submissions during flaky connections could double-count stock; enforce unique client-generated idempotency IDs on every queued mobile movement.
+- **Risks & Mitigations:** Duplicate tap/retry submissions during flaky connections could double-count stock; reuse the unique `UUIDv7` primary keys and unique `idempotency_key` (`UUID`) column on `inventory.stock_movements` (present from Phase 1 per ADR-0002) on every queued mobile movement.
 
 ## Related Decisions
 
