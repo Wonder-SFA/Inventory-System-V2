@@ -117,7 +117,7 @@ export async function listLocations(
 }
 
 export async function getLocationById(
-  db: Database,
+  db: Database | DbTransaction,
   scope: LocationScope,
   id: string,
 ): Promise<Location | null> {
@@ -141,7 +141,7 @@ export async function getLocationById(
 }
 
 export async function getLocationsByIds(
-  db: Database,
+  db: Database | DbTransaction,
   scope: LocationScope,
   ids: readonly string[],
 ): Promise<Location[]> {

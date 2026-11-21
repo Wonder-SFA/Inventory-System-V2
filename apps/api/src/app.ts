@@ -19,7 +19,7 @@ import {
   INVENTORY_MODULE,
   registerInventoryRoutes,
 } from './modules/inventory/public/index.js';
-import { ORDERS_MODULE } from './modules/orders/public/index.js';
+import { ORDERS_MODULE, registerOrdersRoutes } from './modules/orders/public/index.js';
 import {
   type RateLimitOptions,
   apiErrorHandler,
@@ -79,6 +79,7 @@ export function buildApp(deps: AppDeps = {}): FastifyInstance {
       outboxDispatcher: deps.outboxDispatcher,
     });
     registerCatalogRoutes(app, { db: deps.db, outboxDispatcher: deps.outboxDispatcher });
+    registerOrdersRoutes(app, { db: deps.db, outboxDispatcher: deps.outboxDispatcher });
   }
 
   app.get('/health', async () => {
