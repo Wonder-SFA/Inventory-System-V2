@@ -43,6 +43,7 @@ describe('database schema migrations', () => {
       '0001_init_schemas.sql',
       '0002_shared_outbox_idempotency.sql',
       '0003_iam_auth_and_access_switch.sql',
+      '0004_catalog_schema.sql',
     ]);
 
     const tables = await pool.query<{ table_name: string }>(

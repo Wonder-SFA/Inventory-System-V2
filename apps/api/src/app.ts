@@ -9,7 +9,7 @@ import {
   validatorCompiler,
 } from 'fastify-type-provider-zod';
 import type { Pool } from 'pg';
-import { CATALOG_MODULE } from './modules/catalog/public/index.js';
+import { CATALOG_MODULE, registerCatalogRoutes } from './modules/catalog/public/index.js';
 import {
   IAM_MODULE,
   createAuth,
@@ -71,6 +71,7 @@ export function buildApp(deps: AppDeps = {}): FastifyInstance {
   if (deps.db) {
     const auth = createAuth(deps.db, { nodeEnv });
     registerIamRoutes(app, { db: deps.db, auth });
+    registerCatalogRoutes(app, { db: deps.db, outboxDispatcher: deps.outboxDispatcher });
   }
 
   app.get('/health', async () => {
