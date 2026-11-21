@@ -397,5 +397,68 @@ describe('API Spine (Fastify, OpenAPI, Envelopes, Pagination, Rate Limiting, Pro
         await app.close();
       }
     });
+
+    it('isolates rate-limit buckets per authenticated user and ignores spoofable x-actor-id header', async () => {
+      const db = createDb(pool);
+      const app = buildApp({
+        pool,
+        db,
+        rateLimit: {
+          enabled: true,
+          read: { max: 2, timeWindow: '1 minute' },
+        },
+      });
+
+      const signUpUser = async (email: string): Promise<string> => {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/api/auth/sign-up/email',
+          payload: { email, password: 'password1234', name: email },
+        });
+        expect(res.statusCode).toBe(200);
+        const setCookie = res.headers['set-cookie'];
+        const list = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
+        return list.map((c) => c.split(';')[0]).join('; ');
+      };
+
+      try {
+        const userACookie = await signUpUser('ratelimit-a@inventory.local');
+        const userBCookie = await signUpUser('ratelimit-b@inventory.local');
+
+        // User A makes 2 reads (even with different spoofed x-actor-id headers) -> both succeed
+        const a1 = await app.inject({
+          method: 'GET',
+          url: '/api/v1/session',
+          headers: { cookie: userACookie, 'x-actor-id': 'spoof-1' },
+        });
+        expect(a1.statusCode).toBe(200);
+
+        const a2 = await app.inject({
+          method: 'GET',
+          url: '/api/v1/session',
+          headers: { cookie: userACookie, 'x-actor-id': 'spoof-2' },
+        });
+        expect(a2.statusCode).toBe(200);
+
+        // User A's 3rd read with yet another spoofed x-actor-id is still rate-limited (429)
+        const a3 = await app.inject({
+          method: 'GET',
+          url: '/api/v1/session',
+          headers: { cookie: userACookie, 'x-actor-id': 'spoof-3' },
+        });
+        expect(a3.statusCode).toBe(429);
+        expect(a3.json().error.code).toBe(ERROR_CODES.RATE_LIMITED);
+
+        // User B from the same IP has an independent bucket and is NOT rate-limited
+        const b1 = await app.inject({
+          method: 'GET',
+          url: '/api/v1/session',
+          headers: { cookie: userBCookie },
+        });
+        expect(b1.statusCode).toBe(200);
+      } finally {
+        await app.close();
+      }
+    });
   });
 });

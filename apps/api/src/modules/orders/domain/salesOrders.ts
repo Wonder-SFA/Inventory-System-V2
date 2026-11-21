@@ -247,15 +247,15 @@ export async function createSalesOrder(
     input.lines.map((l) => l.skuId),
   );
 
-  const soId = uuidv7();
+  const salesOrderId = uuidv7();
   const orderNumber =
     input.orderNumber ??
-    `SO-${Date.now().toString(36).toUpperCase()}-${soId.slice(-4).toUpperCase()}`;
+    `SLS-${Date.now().toString(36).toUpperCase()}-${salesOrderId.slice(-4).toUpperCase()}`;
 
-  const [createdSo] = await tx
+  const [createdOrder] = await tx
     .insert(salesOrders)
     .values({
-      id: soId,
+      id: salesOrderId,
       orderNumber,
       customerId: input.customerId,
       locationId: input.locationId,
@@ -268,7 +268,7 @@ export async function createSalesOrder(
   await tx.insert(salesOrderLines).values(
     input.lines.map((line) => ({
       id: uuidv7(),
-      salesOrderId: soId,
+      salesOrderId,
       skuId: line.skuId,
       orderedQty: line.orderedQty,
       fulfilledQty: ZERO_DECIMAL4,
@@ -278,7 +278,7 @@ export async function createSalesOrder(
     })),
   );
 
-  const [enriched] = await enrichSalesOrders(tx, [createdSo!]);
+  const [enriched] = await enrichSalesOrders(tx, [createdOrder!]);
   const dto = enriched!;
 
   if (emit) {

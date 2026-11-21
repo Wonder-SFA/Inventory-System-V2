@@ -12,6 +12,7 @@ import {
   SkuLookupQuerySchema,
   UpdateProductSchema,
   UpdateSkuSchema,
+  UpdateUnitOfMeasureSchema,
   UuidParamSchema,
   uuidv7,
 } from '@iv2/shared-domain';
@@ -24,6 +25,7 @@ import {
   type OutboxDispatcher,
   applyKeysetOrder,
   executeCommand,
+  getPgErrorCode,
   paginateKeysetResult,
 } from '../../../shared/index.js';
 import { catalogProducts, catalogSkus, catalogUnitsOfMeasure } from '../db/index.js';
@@ -36,7 +38,6 @@ import {
   hasProductReferences,
   hasSkuReferences,
   hasUnitOfMeasureReferences,
-  isPgErrorCode,
   toProductDto,
   toSkuDto,
   toUnitOfMeasureDto,
@@ -100,7 +101,7 @@ export function registerCatalogRoutes(
         reply,
         { action: 'create', resource: 'unit_of_measure' },
         async (ctx) => {
-          await assertNoUnitOfMeasureConflict(ctx.tx, code, name);
+          await assertNoUnitOfMeasureConflict(ctx.tx, { code, name });
           const now = new Date();
           const id = uuidv7();
           let inserted;
@@ -111,12 +112,13 @@ export function registerCatalogRoutes(
                 id,
                 code,
                 name,
+                status: 'ACTIVE',
                 createdAt: now,
                 updatedAt: now,
               })
               .returning();
           } catch (err) {
-            if (isPgErrorCode(err, '23505')) {
+            if (getPgErrorCode(err) === '23505') {
               throw new ConflictError(
                 ERROR_CODES.UNIT_OF_MEASURE_CONFLICT,
                 'A Unit of Measure with that code or name already exists',
@@ -146,16 +148,24 @@ export function registerCatalogRoutes(
       },
     },
     async (request) => {
-      const { cursor, limit } = request.query;
+      const { cursor, limit, status } = request.query;
       const keyset = applyKeysetOrder(
         catalogUnitsOfMeasure.createdAt,
         catalogUnitsOfMeasure.id,
         cursor,
       );
+      const filters: SQL[] = [];
+      if (keyset.where) {
+        filters.push(keyset.where);
+      }
+      if (status) {
+        filters.push(eq(catalogUnitsOfMeasure.status, status));
+      }
+
       const rows = await db
         .select()
         .from(catalogUnitsOfMeasure)
-        .where(keyset.where)
+        .where(filters.length > 0 ? and(...filters) : undefined)
         .orderBy(...keyset.orderBy)
         .limit(limit + 1);
 
@@ -169,6 +179,151 @@ export function registerCatalogRoutes(
         },
         meta: { requestId: request.id },
       };
+    },
+  );
+
+  typedApp.patch(
+    '/api/v1/units-of-measure/:id',
+    {
+      schema: {
+        params: UuidParamSchema,
+        body: UpdateUnitOfMeasureSchema,
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { code, name } = request.body;
+      return runCommand(
+        request,
+        reply,
+        { action: 'update', resource: 'unit_of_measure' },
+        async (ctx) => {
+          const [existing] = await ctx.tx
+            .select()
+            .from(catalogUnitsOfMeasure)
+            .where(eq(catalogUnitsOfMeasure.id, id))
+            .limit(1);
+          if (!existing) {
+            throw new NotFoundError(ERROR_CODES.NOT_FOUND, `Unit of Measure ${id} not found`);
+          }
+
+          await assertNoUnitOfMeasureConflict(ctx.tx, { code, name }, id);
+
+          let updated;
+          try {
+            [updated] = await ctx.tx
+              .update(catalogUnitsOfMeasure)
+              .set({
+                ...(code !== undefined ? { code } : {}),
+                ...(name !== undefined ? { name } : {}),
+                updatedAt: new Date(),
+              })
+              .where(eq(catalogUnitsOfMeasure.id, id))
+              .returning();
+          } catch (err) {
+            if (getPgErrorCode(err) === '23505') {
+              throw new ConflictError(
+                ERROR_CODES.UNIT_OF_MEASURE_CONFLICT,
+                'A Unit of Measure with that code or name already exists',
+              );
+            }
+            throw err;
+          }
+
+          const dto = toUnitOfMeasureDto(updated!);
+          await ctx.emit({
+            eventType: 'UnitOfMeasureUpdated',
+            aggregateType: 'UnitOfMeasure',
+            aggregateId: dto.id,
+            payload: dto,
+          });
+          return { data: dto, statusCode: 200 };
+        },
+      );
+    },
+  );
+
+  typedApp.post(
+    '/api/v1/units-of-measure/:id/archive',
+    {
+      schema: {
+        params: UuidParamSchema,
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      return runCommand(
+        request,
+        reply,
+        { action: 'archive', resource: 'unit_of_measure' },
+        async (ctx) => {
+          const [existing] = await ctx.tx
+            .select()
+            .from(catalogUnitsOfMeasure)
+            .where(eq(catalogUnitsOfMeasure.id, id))
+            .limit(1);
+          if (!existing) {
+            throw new NotFoundError(ERROR_CODES.NOT_FOUND, `Unit of Measure ${id} not found`);
+          }
+
+          const [updated] = await ctx.tx
+            .update(catalogUnitsOfMeasure)
+            .set({ status: 'ARCHIVED', updatedAt: new Date() })
+            .where(eq(catalogUnitsOfMeasure.id, id))
+            .returning();
+
+          const dto = toUnitOfMeasureDto(updated!);
+          await ctx.emit({
+            eventType: 'UnitOfMeasureArchived',
+            aggregateType: 'UnitOfMeasure',
+            aggregateId: dto.id,
+            payload: dto,
+          });
+          return { data: dto, statusCode: 200 };
+        },
+      );
+    },
+  );
+
+  typedApp.post(
+    '/api/v1/units-of-measure/:id/unarchive',
+    {
+      schema: {
+        params: UuidParamSchema,
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      return runCommand(
+        request,
+        reply,
+        { action: 'unarchive', resource: 'unit_of_measure' },
+        async (ctx) => {
+          const [existing] = await ctx.tx
+            .select()
+            .from(catalogUnitsOfMeasure)
+            .where(eq(catalogUnitsOfMeasure.id, id))
+            .limit(1);
+          if (!existing) {
+            throw new NotFoundError(ERROR_CODES.NOT_FOUND, `Unit of Measure ${id} not found`);
+          }
+
+          const [updated] = await ctx.tx
+            .update(catalogUnitsOfMeasure)
+            .set({ status: 'ACTIVE', updatedAt: new Date() })
+            .where(eq(catalogUnitsOfMeasure.id, id))
+            .returning();
+
+          const dto = toUnitOfMeasureDto(updated!);
+          await ctx.emit({
+            eventType: 'UnitOfMeasureUnarchived',
+            aggregateType: 'UnitOfMeasure',
+            aggregateId: dto.id,
+            payload: dto,
+          });
+          return { data: dto, statusCode: 200 };
+        },
+      );
     },
   );
 
@@ -205,7 +360,7 @@ export function registerCatalogRoutes(
           try {
             await ctx.tx.delete(catalogUnitsOfMeasure).where(eq(catalogUnitsOfMeasure.id, id));
           } catch (err) {
-            if (isPgErrorCode(err, '23503')) {
+            if (getPgErrorCode(err) === '23503') {
               throw new ConflictError(
                 ERROR_CODES.RESOURCE_IN_USE,
                 'Unit of Measure is referenced by existing SKUs and cannot be deleted',
@@ -484,7 +639,7 @@ export function registerCatalogRoutes(
         try {
           await ctx.tx.delete(catalogProducts).where(eq(catalogProducts.id, id));
         } catch (err) {
-          if (isPgErrorCode(err, '23503')) {
+          if (getPgErrorCode(err) === '23503') {
             throw new ConflictError(
               ERROR_CODES.RESOURCE_IN_USE,
               'Product has dependent records and cannot be deleted',
@@ -541,7 +696,7 @@ export function registerCatalogRoutes(
             })
             .returning();
         } catch (err) {
-          if (isPgErrorCode(err, '23505')) {
+          if (getPgErrorCode(err) === '23505') {
             throw new ConflictError(
               ERROR_CODES.SKU_CODE_CONFLICT,
               `SKU code "${code}" is already in use (including archived SKUs)`,
@@ -694,7 +849,7 @@ export function registerCatalogRoutes(
             .where(eq(catalogSkus.id, id))
             .returning();
         } catch (err) {
-          if (isPgErrorCode(err, '23505')) {
+          if (getPgErrorCode(err) === '23505') {
             throw new ConflictError(
               ERROR_CODES.SKU_CODE_CONFLICT,
               `SKU code "${code}" is already in use (including archived SKUs)`,
@@ -818,7 +973,7 @@ export function registerCatalogRoutes(
         try {
           await ctx.tx.delete(catalogSkus).where(eq(catalogSkus.id, id));
         } catch (err) {
-          if (isPgErrorCode(err, '23503')) {
+          if (getPgErrorCode(err) === '23503') {
             throw new ConflictError(
               ERROR_CODES.RESOURCE_IN_USE,
               'SKU has dependent records and cannot be deleted; archive it instead',

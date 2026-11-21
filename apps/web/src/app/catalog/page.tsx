@@ -32,6 +32,8 @@ export default function CatalogPage() {
 
   // Units of Measure state
   const [units, setUnits] = useState<UnitOfMeasure[]>([]);
+  const [unitStatusFilter, setUnitStatusFilter] = useState<StatusFilter>('ACTIVE');
+  const [editingUnitId, setEditingUnitId] = useState<string | null>(null);
   const [unitCode, setUnitCode] = useState('');
   const [unitName, setUnitName] = useState('');
 
@@ -71,8 +73,12 @@ export default function CatalogPage() {
     return map;
   }, [units]);
 
-  const loadUnits = useCallback(async () => {
-    const res = await apiFetchPaginated<UnitOfMeasure>('/api/v1/units-of-measure?limit=100');
+  const loadUnits = useCallback(async (status: StatusFilter) => {
+    const params = new URLSearchParams({ limit: '100' });
+    if (status !== 'ALL') {
+      params.set('status', status);
+    }
+    const res = await apiFetchPaginated<UnitOfMeasure>(`/api/v1/units-of-measure?${params.toString()}`);
     setUnits(res.data);
   }, []);
 
@@ -101,14 +107,22 @@ export default function CatalogPage() {
     setError(null);
     try {
       await Promise.all([
-        loadUnits(),
+        loadUnits(unitStatusFilter),
         loadProducts(productStatusFilter),
         loadSkus(skuStatusFilter, skuProductFilter),
       ]);
     } catch (err) {
       setError(getErrorMessage(err));
     }
-  }, [loadUnits, loadProducts, loadSkus, productStatusFilter, skuStatusFilter, skuProductFilter]);
+  }, [
+    loadUnits,
+    loadProducts,
+    loadSkus,
+    unitStatusFilter,
+    productStatusFilter,
+    skuStatusFilter,
+    skuProductFilter,
+  ]);
 
   useEffect(() => {
     void refreshAll();
@@ -117,18 +131,52 @@ export default function CatalogPage() {
   useLiveRefresh([SSE_TOPICS.CATALOG], refreshAll);
 
   // Unit of Measure handlers
-  async function handleCreateUnit(e: FormEvent) {
+  function startEditUnit(unit: UnitOfMeasure) {
+    setEditingUnitId(unit.id);
+    setUnitCode(unit.code);
+    setUnitName(unit.name);
+  }
+
+  function resetUnitForm() {
+    setEditingUnitId(null);
+    setUnitCode('');
+    setUnitName('');
+  }
+
+  async function handleSaveUnit(e: FormEvent) {
     e.preventDefault();
     setError(null);
     setBusy(true);
     try {
-      await apiFetch<UnitOfMeasure>('/api/v1/units-of-measure', {
+      if (editingUnitId) {
+        await apiFetch<UnitOfMeasure>(`/api/v1/units-of-measure/${editingUnitId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ code: unitCode, name: unitName }),
+        });
+      } else {
+        await apiFetch<UnitOfMeasure>('/api/v1/units-of-measure', {
+          method: 'POST',
+          body: JSON.stringify({ code: unitCode, name: unitName }),
+        });
+      }
+      resetUnitForm();
+      await loadUnits(unitStatusFilter);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleToggleUnitArchive(unit: UnitOfMeasure) {
+    setError(null);
+    setBusy(true);
+    try {
+      const action = unit.status === 'ACTIVE' ? 'archive' : 'unarchive';
+      await apiFetch<UnitOfMeasure>(`/api/v1/units-of-measure/${unit.id}/${action}`, {
         method: 'POST',
-        body: JSON.stringify({ code: unitCode, name: unitName }),
       });
-      setUnitCode('');
-      setUnitName('');
-      await loadUnits();
+      await loadUnits(unitStatusFilter);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -141,7 +189,7 @@ export default function CatalogPage() {
     setBusy(true);
     try {
       await apiFetch(`/api/v1/units-of-measure/${id}`, { method: 'DELETE' });
-      await loadUnits();
+      await loadUnits(unitStatusFilter);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -369,19 +417,19 @@ export default function CatalogPage() {
         {activeTab === 'units' && (
           <div>
             <form
-              onSubmit={handleCreateUnit}
+              onSubmit={handleSaveUnit}
               style={{
                 display: 'grid',
-                gridTemplateColumns: '1fr 2fr auto',
+                gridTemplateColumns: '1fr 2fr auto auto',
                 gap: 12,
                 alignItems: 'end',
                 marginBottom: 20,
               }}
             >
               <div className="form-field" style={{ marginBottom: 0 }}>
-                <label htmlFor="uom-code">Code</label>
+                <label htmlFor="unit-of-measure-code">Code</label>
                 <input
-                  id="uom-code"
+                  id="unit-of-measure-code"
                   value={unitCode}
                   onChange={(e) => setUnitCode(e.target.value)}
                   placeholder="e.g. pcs, kg, L"
@@ -389,9 +437,9 @@ export default function CatalogPage() {
                 />
               </div>
               <div className="form-field" style={{ marginBottom: 0 }}>
-                <label htmlFor="uom-name">Name</label>
+                <label htmlFor="unit-of-measure-name">Name</label>
                 <input
-                  id="uom-name"
+                  id="unit-of-measure-name"
                   value={unitName}
                   onChange={(e) => setUnitName(e.target.value)}
                   placeholder="e.g. Pieces"
@@ -399,16 +447,37 @@ export default function CatalogPage() {
                 />
               </div>
               <button type="submit" className="btn btn-primary" disabled={busy}>
-                Add Unit of Measure
+                {editingUnitId ? 'Save Unit of Measure' : 'Add Unit of Measure'}
               </button>
+              {editingUnitId && (
+                <button type="button" className="btn" onClick={resetUnitForm} disabled={busy}>
+                  Cancel
+                </button>
+              )}
             </form>
+
+            <div className="toolbar">
+              <div style={{ display: 'flex', gap: 8 }}>
+                {(['ACTIVE', 'ARCHIVED', 'ALL'] as const).map((status) => (
+                  <button
+                    key={status}
+                    type="button"
+                    className={`btn btn-sm${unitStatusFilter === status ? ' btn-primary' : ''}`}
+                    onClick={() => setUnitStatusFilter(status)}
+                  >
+                    {status === 'ALL' ? 'All' : status === 'ACTIVE' ? 'Active' : 'Archived'}
+                  </button>
+                ))}
+              </div>
+            </div>
 
             <table className="data-table">
               <thead>
                 <tr>
                   <th>Code</th>
                   <th>Name</th>
-                  <th style={{ width: 120 }}>Actions</th>
+                  <th>Status</th>
+                  <th style={{ width: 240 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -419,21 +488,48 @@ export default function CatalogPage() {
                     </td>
                     <td>{u.name}</td>
                     <td>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-danger"
-                        disabled={busy}
-                        onClick={() => void handleDeleteUnit(u.id)}
+                      <span
+                        className={`badge ${
+                          u.status === 'ACTIVE' ? 'badge-active' : 'badge-archived'
+                        }`}
                       >
-                        Delete
-                      </button>
+                        {u.status}
+                      </span>
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={busy}
+                          onClick={() => startEditUnit(u)}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={busy}
+                          onClick={() => void handleToggleUnitArchive(u)}
+                        >
+                          {u.status === 'ACTIVE' ? 'Archive' : 'Unarchive'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-danger"
+                          disabled={busy}
+                          onClick={() => void handleDeleteUnit(u.id)}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
                 {units.length === 0 && (
                   <tr>
-                    <td colSpan={3} style={{ color: 'var(--muted)', textAlign: 'center' }}>
-                      No Units of Measure yet.
+                    <td colSpan={4} style={{ color: 'var(--muted)', textAlign: 'center' }}>
+                      No Units of Measure match the selected filter.
                     </td>
                   </tr>
                 )}

@@ -30,11 +30,7 @@ function resolveTier(
 }
 
 function resolveUserKey(request: FastifyRequest): string {
-  const actorHeader = request.headers['x-actor-id'];
-  if (typeof actorHeader === 'string' && actorHeader.length > 0) {
-    return actorHeader;
-  }
-  return request.ip;
+  return request.accessPolicy?.actor.id ?? request.ip;
 }
 
 export async function registerRateLimiting(
@@ -58,6 +54,7 @@ export async function registerRateLimiting(
 
   await app.register(rateLimit, {
     global: true,
+    hook: 'preHandler',
     allowList: (request) => request.url === '/health' || request.url === '/ready',
     keyGenerator: (request) => {
       const { name } = resolveTier(request, tiers);

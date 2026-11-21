@@ -15,25 +15,12 @@ import {
   type DbTransaction,
   type DomainEventInput,
   applyKeysetOrder,
+  getPgErrorCode,
   paginateKeysetResult,
 } from '../../../shared/index.js';
 import { type CustomerRow, customers, salesOrders } from '../db/index.js';
 
 export type CustomerEmitEventFn = (event: DomainEventInput) => Promise<void>;
-
-function getPgErrorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) {
-    return undefined;
-  }
-  const err = error as { code?: unknown; cause?: { code?: unknown } };
-  if (typeof err.code === 'string') {
-    return err.code;
-  }
-  if (typeof err.cause?.code === 'string') {
-    return err.cause.code;
-  }
-  return undefined;
-}
 
 export function toCustomerDto(row: CustomerRow): Customer {
   return {

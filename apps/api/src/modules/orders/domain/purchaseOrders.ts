@@ -320,14 +320,15 @@ export async function createPurchaseOrder(
     input.lines.map((l) => l.skuId),
   );
 
-  const poId = uuidv7();
+  const purchaseOrderId = uuidv7();
   const orderNumber =
-    input.orderNumber ?? `PO-${Date.now().toString(36).toUpperCase()}-${poId.slice(-4).toUpperCase()}`;
+    input.orderNumber ??
+    `PUR-${Date.now().toString(36).toUpperCase()}-${purchaseOrderId.slice(-4).toUpperCase()}`;
 
-  const [createdPo] = await tx
+  const [createdOrder] = await tx
     .insert(purchaseOrders)
     .values({
-      id: poId,
+      id: purchaseOrderId,
       orderNumber,
       supplierId: input.supplierId,
       locationId: input.locationId,
@@ -340,7 +341,7 @@ export async function createPurchaseOrder(
   await tx.insert(purchaseOrderLines).values(
     input.lines.map((line) => ({
       id: uuidv7(),
-      purchaseOrderId: poId,
+      purchaseOrderId,
       skuId: line.skuId,
       orderedQty: line.orderedQty,
       fulfilledQty: ZERO_DECIMAL4,
@@ -349,7 +350,7 @@ export async function createPurchaseOrder(
     })),
   );
 
-  const [enriched] = await enrichPurchaseOrders(tx, [createdPo!]);
+  const [enriched] = await enrichPurchaseOrders(tx, [createdOrder!]);
   return enriched!;
 }
 
