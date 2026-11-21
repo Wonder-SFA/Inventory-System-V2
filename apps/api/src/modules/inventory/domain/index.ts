@@ -1,1 +1,1 @@
-export {};
+export * from './locations.js';

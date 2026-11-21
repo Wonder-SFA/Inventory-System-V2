@@ -1,4 +1,4 @@
-import type { ApiError, ApiSuccess } from '@iv2/shared-domain';
+import type { ApiError, ApiPaginated, ApiSuccess } from '@iv2/shared-domain';
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -62,6 +62,13 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
   }
 
   return parsed as ApiSuccess<T>;
+}
+
+export async function apiFetchPaginated<T>(
+  path: string,
+  options: ApiFetchOptions = {},
+): Promise<ApiPaginated<T>> {
+  return (await apiFetch<T[]>(path, options)) as unknown as ApiPaginated<T>;
 }
 
 export interface SessionInfo {
