@@ -1,0 +1,606 @@
+import { createDb, createPool, resetTestDatabase } from '@iv2/db';
+import {
+  type Customer,
+  ERROR_CODES,
+  type SalesOrder,
+  type StockBalance,
+  type StockMovement,
+  uuidv7,
+} from '@iv2/shared-domain';
+import type { Pool } from 'pg';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { buildApp } from '../../app.js';
+import { OutboxDispatcher } from '../../shared/index.js';
+
+const testDbUrl = process.env.TEST_DATABASE_URL;
+
+function extractCookieHeader(setCookieHeaders: string | string[] | undefined): string {
+  const list = Array.isArray(setCookieHeaders)
+    ? setCookieHeaders
+    : setCookieHeaders
+      ? [setCookieHeaders]
+      : [];
+  return list.map((cookie) => cookie.split(';')[0]).join('; ');
+}
+
+describe('orders: customers & sales order lifecycle integration', () => {
+  let pool: Pool;
+
+  beforeAll(() => {
+    if (!testDbUrl) {
+      throw new Error('TEST_DATABASE_URL is required');
+    }
+    pool = createPool(testDbUrl);
+  });
+
+  beforeEach(async () => {
+    await resetTestDatabase(pool);
+  });
+
+  afterAll(async () => {
+    await pool?.end();
+  });
+
+  async function setupFixture() {
+    const db = createDb(pool);
+    const emittedEvents: Array<{ eventType: string; aggregateId: string; payload: unknown }> = [];
+    const outboxDispatcher = new OutboxDispatcher(db);
+    outboxDispatcher.registerConsumer('test-sales-orders-observer', async (event) => {
+      emittedEvents.push({
+        eventType: event.eventType,
+        aggregateId: event.aggregateId,
+        payload: event.payload,
+      });
+    });
+
+    const app = buildApp({ pool, db, outboxDispatcher, nodeEnv: 'test' });
+
+    const signUpRes = await app.inject({
+      method: 'POST',
+      url: '/api/auth/sign-up/email',
+      payload: {
+        name: 'Sales Clerk',
+        email: 'sales@example.com',
+        password: 'password1234',
+      },
+    });
+    expect(signUpRes.statusCode).toBe(200);
+    const cookie = extractCookieHeader(signUpRes.headers['set-cookie']);
+
+    const uomRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/units-of-measure',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'PCS', name: 'Pieces' },
+    });
+    expect(uomRes.statusCode).toBe(201);
+    const uomId = uomRes.json().data.id as string;
+
+    const productRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/products',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Widget Pro' },
+    });
+    expect(productRes.statusCode).toBe(201);
+    const productId = productRes.json().data.id as string;
+
+    const skuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId,
+        code: 'WGT-001',
+        name: 'Widget Pro Standard',
+        unitOfMeasureId: uomId,
+      },
+    });
+    expect(skuRes.statusCode).toBe(201);
+    const skuId = skuRes.json().data.id as string;
+
+    const locRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/locations',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Main Warehouse', type: 'WAREHOUSE' },
+    });
+    expect(locRes.statusCode).toBe(201);
+    const locationId = locRes.json().data.id as string;
+
+    const custRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/customers',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        name: 'Acme Retail Co.',
+        email: 'buyer@acmeretail.example',
+        phone: '+1-555-0200',
+        address: '456 Commerce Ave',
+      },
+    });
+    expect(custRes.statusCode).toBe(201);
+    const customer = custRes.json().data as Customer;
+
+    return {
+      app,
+      cookie,
+      skuId,
+      locationId,
+      customer,
+      outboxDispatcher,
+      emittedEvents,
+    };
+  }
+
+  async function seedStock(
+    app: ReturnType<typeof buildApp>,
+    cookie: string,
+    skuId: string,
+    locationId: string,
+    quantityDelta: string,
+    unitCost: string,
+  ) {
+    const adjRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/stock-movements/adjustments',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        skuId,
+        locationId,
+        quantityDelta,
+        reasonCategory: 'STOCK_COUNT',
+        unitCost,
+        currency: 'USD',
+      },
+    });
+    expect(adjRes.statusCode).toBe(201);
+  }
+
+  it('supports Customer CRUD, archive/unarchive, cursor pagination, and hard-delete protection', async () => {
+    const { app, cookie, skuId, locationId, customer } = await setupFixture();
+
+    const create2 = await app.inject({
+      method: 'POST',
+      url: '/api/v1/customers',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Beta Wholesale' },
+    });
+    expect(create2.statusCode).toBe(201);
+    const customer2 = create2.json().data as Customer;
+
+    const page1 = await app.inject({
+      method: 'GET',
+      url: '/api/v1/customers?limit=1&status=ACTIVE',
+      headers: { cookie },
+    });
+    expect(page1.statusCode).toBe(200);
+    expect(page1.json().data).toHaveLength(1);
+    expect(page1.json().page.hasMore).toBe(true);
+
+    const page2 = await app.inject({
+      method: 'GET',
+      url: `/api/v1/customers?limit=1&status=ACTIVE&cursor=${page1.json().page.nextCursor}`,
+      headers: { cookie },
+    });
+    expect(page2.statusCode).toBe(200);
+    expect(page2.json().data).toHaveLength(1);
+    expect(page2.json().data[0].id).not.toBe(page1.json().data[0].id);
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/customers/${customer.id}`,
+      headers: { cookie },
+      payload: { name: 'Acme Retail Updated', phone: '+1-555-9999' },
+    });
+    expect(patchRes.statusCode).toBe(200);
+    expect(patchRes.json().data.name).toBe('Acme Retail Updated');
+
+    const archRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/customers/${customer2.id}/archive`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(archRes.statusCode).toBe(200);
+    expect(archRes.json().data.status).toBe('ARCHIVED');
+
+    const unarchRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/customers/${customer2.id}/unarchive`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(unarchRes.statusCode).toBe(200);
+    expect(unarchRes.json().data.status).toBe('ACTIVE');
+
+    // Create a Sales Order referencing customer
+    const soRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        customerId: customer.id,
+        locationId,
+        lines: [{ skuId, orderedQty: '2', unitPrice: '25.00', currency: 'USD' }],
+      },
+    });
+    expect(soRes.statusCode).toBe(201);
+
+    // Deleting referenced customer returns 409 RESOURCE_IN_USE
+    const delRefRes = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/customers/${customer.id}`,
+      headers: { cookie },
+    });
+    expect(delRefRes.statusCode).toBe(409);
+    expect(delRefRes.json().error.code).toBe(ERROR_CODES.RESOURCE_IN_USE);
+
+    // Deleting referenced SKU / Location returns 409 RESOURCE_IN_USE
+    const delSkuRes = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie },
+    });
+    expect(delSkuRes.statusCode).toBe(409);
+    expect(delSkuRes.json().error.code).toBe(ERROR_CODES.RESOURCE_IN_USE);
+
+    const delLocRes = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/locations/${locationId}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(delLocRes.statusCode).toBe(409);
+    expect(delLocRes.json().error.code).toBe(ERROR_CODES.RESOURCE_IN_USE);
+
+    // Deleting unreferenced customer2 succeeds
+    const delOkRes = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/customers/${customer2.id}`,
+      headers: { cookie },
+    });
+    expect(delOkRes.statusCode).toBe(200);
+    expect(delOkRes.json().data.deleted).toBe(true);
+  });
+
+  it('enforces Draft optimistic locking (409 STALE_VERSION), reserves stock on confirm with negative Available Stock warning, and handles partial/full shipments with WAC & 422 OVER_SHIP_NOT_ALLOWED', async () => {
+    const { app, cookie, skuId, locationId, customer, outboxDispatcher, emittedEvents } =
+      await setupFixture();
+
+    // Seed 5 units at WAC = 10.0000
+    await seedStock(app, cookie, skuId, locationId, '5', '10.0000');
+
+    // Create Draft SO for 8 units (will push Available Stock to -3.0000 on confirm!)
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        orderNumber: 'SO-1001',
+        customerId: customer.id,
+        locationId,
+        note: 'Urgent order',
+        lines: [{ skuId, orderedQty: '6', unitPrice: '20.00', currency: 'USD' }],
+      },
+    });
+    expect(createRes.statusCode).toBe(201);
+    const draft = createRes.json().data as SalesOrder;
+    expect(draft.status).toBe('DRAFT');
+    expect(draft.version).toBe(1);
+
+    // Edit Draft with correct expectedVersion: 1 -> increments to 2
+    const patchOk = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/sales-orders/${draft.id}`,
+      headers: { cookie },
+      payload: {
+        expectedVersion: 1,
+        note: 'Updated to 8 units',
+        lines: [{ skuId, orderedQty: '8', unitPrice: '22.50', currency: 'USD' }],
+      },
+    });
+    expect(patchOk.statusCode).toBe(200);
+    const updatedDraft = patchOk.json().data as SalesOrder;
+    expect(updatedDraft.version).toBe(2);
+    expect(updatedDraft.lines[0]!.orderedQty).toBe('8.0000');
+
+    // Edit Draft with stale expectedVersion: 1 -> 409 STALE_VERSION
+    const patchStale = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/sales-orders/${draft.id}`,
+      headers: { cookie },
+      payload: {
+        expectedVersion: 1,
+        note: 'Should fail',
+      },
+    });
+    expect(patchStale.statusCode).toBe(409);
+    expect(patchStale.json().error.code).toBe(ERROR_CODES.STALE_VERSION);
+
+    // Confirm SO -> reserves 8 units, Available Stock becomes 5 - 8 = -3 (non-blocking warning)
+    const confirmRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${draft.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(confirmRes.statusCode).toBe(200);
+    const confirmed = confirmRes.json().data as SalesOrder;
+    expect(confirmed.status).toBe('CONFIRMED');
+    expect(confirmRes.json().warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: 'ZERO_OR_NEGATIVE_AVAILABLE_STOCK',
+          skuId,
+          locationId,
+        }),
+      ]),
+    );
+
+    const lineId = confirmed.lines[0]!.id;
+
+    // Verify stock balance after confirm: onHand=5, reserved=8, available=-3
+    const balAfterConfirmRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-balances?skuId=${skuId}&locationId=${locationId}`,
+      headers: { cookie },
+    });
+    const balAfterConfirm = balAfterConfirmRes.json().data[0] as StockBalance;
+    expect(balAfterConfirm.onHand).toBe('5.0000');
+    expect(balAfterConfirm.reserved).toBe('8.0000');
+    expect(balAfterConfirm.available).toBe('-3.0000');
+
+    // Partial shipment of 3 units
+    const shipKey1 = uuidv7();
+    const ship1Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${draft.id}/shipments`,
+      headers: { cookie, 'idempotency-key': shipKey1 },
+      payload: {
+        note: 'First batch',
+        lines: [{ orderLineId: lineId, quantity: '3' }],
+      },
+    });
+    expect(ship1Res.statusCode).toBe(201);
+    expect(ship1Res.json().data.status).toBe('PARTIALLY_SHIPPED');
+    const ship1Movements = ship1Res.json().data.movements as StockMovement[];
+    expect(ship1Movements).toHaveLength(1);
+    expect(ship1Movements[0]!.type).toBe('ISSUE');
+    expect(ship1Movements[0]!.quantityDelta).toBe('-3.0000');
+    expect(ship1Movements[0]!.unitCost).toBe('10.0000'); // WAC captured!
+
+    // Idempotency replay on shipment
+    const ship1Replay = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${draft.id}/shipments`,
+      headers: { cookie, 'idempotency-key': shipKey1 },
+      payload: {
+        note: 'First batch',
+        lines: [{ orderLineId: lineId, quantity: '3' }],
+      },
+    });
+    expect(ship1Replay.statusCode).toBe(201);
+    expect(ship1Replay.json().data.movements[0].id).toBe(ship1Movements[0]!.id);
+
+    // Over-ship attempt (3 fulfilled + 6 = 9 > 8 ordered) -> 422 OVER_SHIP_NOT_ALLOWED
+    const overShipRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${draft.id}/shipments`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: lineId, quantity: '6' }],
+      },
+    });
+    expect(overShipRes.statusCode).toBe(422);
+    expect(overShipRes.json().error.code).toBe(ERROR_CODES.OVER_SHIP_NOT_ALLOWED);
+
+    // Ship remaining 5 units -> transitions to SHIPPED
+    const ship2Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${draft.id}/shipments`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: lineId, quantity: '5' }],
+      },
+    });
+    expect(ship2Res.statusCode).toBe(201);
+    expect(ship2Res.json().data.status).toBe('SHIPPED');
+
+    // Verify stock balance: onHand = 5 - 8 = -3, reserved = 0, available = -3
+    const balAfterShipRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-balances?skuId=${skuId}&locationId=${locationId}`,
+      headers: { cookie },
+    });
+    const balAfterShip = balAfterShipRes.json().data[0] as StockBalance;
+    expect(balAfterShip.onHand).toBe('-3.0000');
+    expect(balAfterShip.reserved).toBe('0.0000');
+    expect(balAfterShip.available).toBe('-3.0000');
+
+    await outboxDispatcher.drainOutbox();
+    const eventTypes = emittedEvents.map((e) => e.eventType);
+    expect(eventTypes).toContain('OrderConfirmed');
+    expect(eventTypes).toContain('StockReserved');
+    expect(eventTypes).toContain('StockReservationReleased');
+    expect(eventTypes).toContain('StockIssued');
+    expect(eventTypes).toContain('SalesOrderShipped');
+  });
+
+  it('supports Delivered transition and Customer Returns (CUSTOMER_RETURN receipt + over-return guard)', async () => {
+    const { app, cookie, skuId, locationId, customer, outboxDispatcher, emittedEvents } =
+      await setupFixture();
+
+    await seedStock(app, cookie, skuId, locationId, '10', '12.0000');
+
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        customerId: customer.id,
+        locationId,
+        lines: [{ skuId, orderedQty: '4', unitPrice: '30.00', currency: 'USD' }],
+      },
+    });
+    const so = createRes.json().data as SalesOrder;
+    const lineId = so.lines[0]!.id;
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { lines: [{ orderLineId: lineId, quantity: '4' }] },
+    });
+
+    // Deliver
+    const deliverRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/deliver`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(deliverRes.statusCode).toBe(200);
+    expect(deliverRes.json().data.status).toBe('DELIVERED');
+
+    // Cannot cancel DELIVERED order
+    const cancelDeliveredRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/cancel`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(cancelDeliveredRes.statusCode).toBe(409);
+    expect(cancelDeliveredRes.json().error.code).toBe(ERROR_CODES.INVALID_ORDER_STATE);
+
+    // Return 2 units
+    const returnRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/returns`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        note: 'Damaged packaging',
+        lines: [{ orderLineId: lineId, quantity: '2' }],
+      },
+    });
+    expect(returnRes.statusCode).toBe(201);
+    const retMovements = returnRes.json().data.movements as StockMovement[];
+    expect(retMovements).toHaveLength(1);
+    expect(retMovements[0]!.type).toBe('RECEIPT');
+    expect(retMovements[0]!.quantityDelta).toBe('2.0000');
+    expect(retMovements[0]!.reasonCategory).toBe('CUSTOMER_RETURN');
+
+    // Over-return (2 + 3 = 5 > 4 fulfilled) -> 422 OVER_RETURN_NOT_ALLOWED
+    const overReturnRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/returns`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: lineId, quantity: '3' }],
+      },
+    });
+    expect(overReturnRes.statusCode).toBe(422);
+    expect(overReturnRes.json().error.code).toBe(ERROR_CODES.OVER_RETURN_NOT_ALLOWED);
+
+    // Stock balance: 10 - 4 + 2 = 8 onHand, 0 reserved, 8 available
+    const balRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-balances?skuId=${skuId}&locationId=${locationId}`,
+      headers: { cookie },
+    });
+    const bal = balRes.json().data[0] as StockBalance;
+    expect(bal.onHand).toBe('8.0000');
+    expect(bal.reserved).toBe('0.0000');
+    expect(bal.available).toBe('8.0000');
+
+    // Verify returnedQty persisted on Sales Order
+    const getSoRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/sales-orders/${so.id}`,
+      headers: { cookie },
+    });
+    expect(getSoRes.json().data.lines[0].returnedQty).toBe('2.0000');
+
+    await outboxDispatcher.drainOutbox();
+    const eventTypes = emittedEvents.map((e) => e.eventType);
+    expect(eventTypes).toContain('SalesOrderDelivered');
+    expect(eventTypes).toContain('SalesOrderReturned');
+  });
+
+  it('releases remaining Reserved Stock when cancelling a Partially Shipped Sales Order while preserving shipped ISSUE movements', async () => {
+    const { app, cookie, skuId, locationId, customer, outboxDispatcher, emittedEvents } =
+      await setupFixture();
+
+    await seedStock(app, cookie, skuId, locationId, '10', '15.0000');
+
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        customerId: customer.id,
+        locationId,
+        lines: [{ skuId, orderedQty: '7', unitPrice: '40.00', currency: 'USD' }],
+      },
+    });
+    const so = createRes.json().data as SalesOrder;
+    const lineId = so.lines[0]!.id;
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+
+    // Ship 3 of 7
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { lines: [{ orderLineId: lineId, quantity: '3' }] },
+    });
+
+    // Before cancel: onHand=7, reserved=4, available=3
+    const balBeforeRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-balances?skuId=${skuId}&locationId=${locationId}`,
+      headers: { cookie },
+    });
+    const balBefore = balBeforeRes.json().data[0] as StockBalance;
+    expect(balBefore.onHand).toBe('7.0000');
+    expect(balBefore.reserved).toBe('4.0000');
+    expect(balBefore.available).toBe('3.0000');
+
+    // Cancel remaining order
+    const cancelRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/cancel`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(cancelRes.statusCode).toBe(200);
+    expect(cancelRes.json().data.status).toBe('CANCELLED');
+
+    // After cancel: onHand=7 (ISSUE preserved!), reserved=0 (4 released!), available=7
+    const balAfterRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-balances?skuId=${skuId}&locationId=${locationId}`,
+      headers: { cookie },
+    });
+    const balAfter = balAfterRes.json().data[0] as StockBalance;
+    expect(balAfter.onHand).toBe('7.0000');
+    expect(balAfter.reserved).toBe('0.0000');
+    expect(balAfter.available).toBe('7.0000');
+
+    // Verify ISSUE movement is still in stock-movements
+    const movRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-movements?skuId=${skuId}&locationId=${locationId}&type=ISSUE`,
+      headers: { cookie },
+    });
+    expect(movRes.json().data).toHaveLength(1);
+    expect(movRes.json().data[0].quantityDelta).toBe('-3.0000');
+
+    await outboxDispatcher.drainOutbox();
+    expect(emittedEvents.map((e) => e.eventType)).toContain('OrderCancelled');
+  });
+});

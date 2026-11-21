@@ -44,6 +44,8 @@ import {
   type PurchaseOrderRow,
   purchaseOrderLines,
   purchaseOrders,
+  salesOrderLines,
+  salesOrders,
   suppliers,
 } from '../db/index.js';
 import { getSupplierById } from './suppliers.js';
@@ -56,24 +58,40 @@ export async function hasOrderSkuReferences(
   db: Database | DbTransaction,
   skuId: string,
 ): Promise<boolean> {
-  const [ref] = await db
+  const [poRef] = await db
     .select({ id: purchaseOrderLines.id })
     .from(purchaseOrderLines)
     .where(eq(purchaseOrderLines.skuId, skuId))
     .limit(1);
-  return Boolean(ref);
+  if (poRef) {
+    return true;
+  }
+  const [soRef] = await db
+    .select({ id: salesOrderLines.id })
+    .from(salesOrderLines)
+    .where(eq(salesOrderLines.skuId, skuId))
+    .limit(1);
+  return Boolean(soRef);
 }
 
 export async function hasOrderLocationReferences(
   db: Database | DbTransaction,
   locationId: string,
 ): Promise<boolean> {
-  const [ref] = await db
+  const [poRef] = await db
     .select({ id: purchaseOrders.id })
     .from(purchaseOrders)
     .where(eq(purchaseOrders.locationId, locationId))
     .limit(1);
-  return Boolean(ref);
+  if (poRef) {
+    return true;
+  }
+  const [soRef] = await db
+    .select({ id: salesOrders.id })
+    .from(salesOrders)
+    .where(eq(salesOrders.locationId, locationId))
+    .limit(1);
+  return Boolean(soRef);
 }
 
 export function registerOrdersReferenceCheckers(): void {

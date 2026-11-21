@@ -1,15 +1,17 @@
 'use client';
 
-import type {
-  Location,
-  PurchaseOrder,
-  PurchaseOrderStatus,
-  ReceivePurchaseOrderResult,
-  Sku,
-  Supplier,
+import {
+  type Location,
+  type PurchaseOrder,
+  type PurchaseOrderStatus,
+  type ReceivePurchaseOrderResult,
+  SSE_TOPICS,
+  type Sku,
+  type Supplier,
 } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
+import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 type StatusFilter = 'ALL' | PurchaseOrderStatus;
@@ -126,6 +128,10 @@ export default function PurchaseOrdersPage() {
       active = false;
     };
   }, [statusFilter, loadReferenceData, loadOrders]);
+
+  useLiveRefresh([SSE_TOPICS.PURCHASE_ORDERS, 'orders'], () =>
+    Promise.all([loadReferenceData(), loadOrders(statusFilter)]).then(() => undefined),
+  );
 
   function resetDraftForm() {
     setEditingOrder(null);
