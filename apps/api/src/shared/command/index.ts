@@ -1,3 +1,1 @@
-export interface CommandContext {
-  correlationId: string;
-}
+export * from './executeCommand.js';

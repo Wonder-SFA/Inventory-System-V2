@@ -1,4 +1,1 @@
-export interface OutboxEventPlaceholder {
-  eventId: string;
-  eventType: string;
-}
+export * from './outboxDispatcher.js';
