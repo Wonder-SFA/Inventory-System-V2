@@ -15,7 +15,10 @@ import {
   createAuth,
   registerIamRoutes,
 } from './modules/iam/public/index.js';
-import { INVENTORY_MODULE } from './modules/inventory/public/index.js';
+import {
+  INVENTORY_MODULE,
+  registerInventoryRoutes,
+} from './modules/inventory/public/index.js';
 import { ORDERS_MODULE } from './modules/orders/public/index.js';
 import {
   type RateLimitOptions,
@@ -71,6 +74,10 @@ export function buildApp(deps: AppDeps = {}): FastifyInstance {
   if (deps.db) {
     const auth = createAuth(deps.db, { nodeEnv });
     registerIamRoutes(app, { db: deps.db, auth });
+    registerInventoryRoutes(app, {
+      db: deps.db,
+      outboxDispatcher: deps.outboxDispatcher,
+    });
   }
 
   app.get('/health', async () => {
