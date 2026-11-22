@@ -30,6 +30,7 @@ export function createAuth(db: Database, options: CreateAuthOptions = {}) {
     'http://127.0.0.1:3000',
     'http://localhost:3001',
     'http://127.0.0.1:3001',
+    'https://fighters-junction-revolution-cow.trycloudflare.com',
   ];
 
   return betterAuth({

@@ -6,7 +6,7 @@
   "main": "./dist/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "node --watch --experimental-strip-types src/server.ts",
+    "dev": "tsx watch --env-file=../../.env src/server.ts",
     "seed:user": "node --experimental-strip-types src/scripts/seedDevUser.ts",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -29,6 +29,7 @@
     "@types/node": "^22.14.0",
     "@types/pg": "^8.23.1",
     "eslint": "^9.25.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.8.2",
     "vitest": "^3.1.2"
   }
