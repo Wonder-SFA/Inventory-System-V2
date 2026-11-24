@@ -21,6 +21,7 @@ export {
   listStockBalances,
   listStockMovements,
   postMovements,
+  previewFefoAllocation,
   receiveTransfer,
   registerInventoryReferenceCheckers,
   registerLocationReferenceChecker,

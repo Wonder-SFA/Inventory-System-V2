@@ -7,7 +7,7 @@ import {
   type StockMovement,
   type StockMovementType,
 } from '@iv2/shared-domain';
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
 import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { apiFetchPaginated } from '../../lib/api-client';
@@ -32,6 +32,38 @@ export default function StockMovementsPage() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+
+  const groupedRows = useMemo(() => {
+    const groups: Array<{ key: string; slices: StockMovement[] }> = [];
+    const byGroupId = new Map<string, { key: string; slices: StockMovement[] }>();
+
+    for (const m of movements) {
+      if (m.movementGroupId) {
+        const existing = byGroupId.get(m.movementGroupId);
+        if (existing) {
+          existing.slices.push(m);
+        } else {
+          const entry = { key: m.movementGroupId, slices: [m] };
+          byGroupId.set(m.movementGroupId, entry);
+          groups.push(entry);
+        }
+      } else {
+        groups.push({ key: m.id, slices: [m] });
+      }
+    }
+
+    for (const g of groups) {
+      if (g.slices.length > 1) {
+        g.slices.sort((a, b) => (a.sliceIndex ?? 0) - (b.sliceIndex ?? 0));
+      }
+    }
+    return groups;
+  }, [movements]);
+
+  function toggleGroup(key: string) {
+    setExpandedGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
 
   const loadMovements = useCallback(
     async (
@@ -208,6 +240,7 @@ export default function StockMovementsPage() {
                   <th>Type</th>
                   <th>SKU</th>
                   <th>Location</th>
+                  <th>Lot</th>
                   <th>Quantity Delta</th>
                   <th>Unit Cost</th>
                   <th>Reason</th>
@@ -216,39 +249,142 @@ export default function StockMovementsPage() {
                 </tr>
               </thead>
               <tbody>
-                {movements.map((m) => (
-                  <tr key={m.id}>
-                    <td style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
-                      {new Date(m.createdAt).toLocaleString()}
-                    </td>
-                    <td>
-                      <span className="badge badge-archived">{m.type}</span>
-                    </td>
-                    <td>
-                      <div style={{ fontWeight: 600 }}>{m.skuCode ?? m.skuId}</div>
-                      {m.skuName && (
-                        <div style={{ fontSize: 12, color: 'var(--muted)' }}>{m.skuName}</div>
-                      )}
-                    </td>
-                    <td>{m.locationName ?? m.locationId}</td>
-                    <td
-                      style={{
-                        fontWeight: 600,
-                        color: m.quantityDelta.startsWith('-')
-                          ? 'var(--danger-text)'
-                          : 'inherit',
-                      }}
-                    >
-                      {m.quantityDelta.startsWith('-') ? m.quantityDelta : `+${m.quantityDelta}`}
-                    </td>
-                    <td>{m.unitCost !== undefined && m.unitCost !== null ? m.unitCost : '—'}</td>
-                    <td>{m.reasonCategory ?? '—'}</td>
-                    <td style={{ fontSize: 12, color: 'var(--muted)' }}>
-                      {m.referenceType ?? '—'}
-                    </td>
-                    <td style={{ fontSize: 13 }}>{m.note ?? '—'}</td>
-                  </tr>
-                ))}
+                {groupedRows.map((group) => {
+                  if (group.slices.length === 1) {
+                    const m = group.slices[0]!;
+                    return (
+                      <tr key={m.id}>
+                        <td style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
+                          {new Date(m.createdAt).toLocaleString()}
+                        </td>
+                        <td>
+                          <span className="badge badge-archived">{m.type}</span>
+                        </td>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>{m.skuCode ?? m.skuId}</div>
+                          {m.skuName && (
+                            <div style={{ fontSize: 12, color: 'var(--muted)' }}>{m.skuName}</div>
+                          )}
+                        </td>
+                        <td>{m.locationName ?? m.locationId}</td>
+                        <td style={{ fontSize: 12 }}>
+                          {m.lotCode ? (
+                            <span className="badge">{m.lotCode}</span>
+                          ) : (
+                            <span style={{ color: 'var(--muted)' }}>—</span>
+                          )}
+                        </td>
+                        <td
+                          style={{
+                            fontWeight: 600,
+                            color: m.quantityDelta.startsWith('-')
+                              ? 'var(--danger-text)'
+                              : 'inherit',
+                          }}
+                        >
+                          {m.quantityDelta.startsWith('-') ? m.quantityDelta : `+${m.quantityDelta}`}
+                        </td>
+                        <td>{m.unitCost !== undefined && m.unitCost !== null ? m.unitCost : '—'}</td>
+                        <td>{m.reasonCategory ?? '—'}</td>
+                        <td style={{ fontSize: 12, color: 'var(--muted)' }}>
+                          {m.referenceType ?? '—'}
+                        </td>
+                        <td style={{ fontSize: 13 }}>{m.note ?? '—'}</td>
+                      </tr>
+                    );
+                  }
+
+                  const first = group.slices[0]!;
+                  const isExpanded = Boolean(expandedGroups[group.key]);
+                  const totalDelta = group.slices
+                    .reduce((acc, s) => acc + Number(s.quantityDelta), 0)
+                    .toFixed(4);
+                  const isNeg = totalDelta.startsWith('-');
+
+                  return (
+                    <Fragment key={group.key}>
+                      <tr style={{ background: 'var(--bg-subtle, #f8fafc)' }}>
+                        <td style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
+                          <button
+                            type="button"
+                            className="btn"
+                            onClick={() => toggleGroup(group.key)}
+                            aria-expanded={isExpanded}
+                            style={{ padding: '2px 6px', fontSize: 11, marginRight: 6 }}
+                          >
+                            {isExpanded ? '▼' : '▶'}
+                          </button>
+                          {new Date(first.createdAt).toLocaleString()}
+                        </td>
+                        <td>
+                          <span className="badge badge-archived">{first.type}</span>
+                        </td>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>{first.skuCode ?? first.skuId}</div>
+                          {first.skuName && (
+                            <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                              {first.skuName}
+                            </div>
+                          )}
+                        </td>
+                        <td>{first.locationName ?? first.locationId}</td>
+                        <td>
+                          <span className="badge badge-active">{group.slices.length} lots</span>
+                        </td>
+                        <td
+                          style={{
+                            fontWeight: 600,
+                            color: isNeg ? 'var(--danger-text)' : 'inherit',
+                          }}
+                        >
+                          {isNeg ? totalDelta : `+${totalDelta}`}
+                        </td>
+                        <td style={{ fontSize: 12, color: 'var(--muted)' }}>Multi-lot</td>
+                        <td>{first.reasonCategory ?? '—'}</td>
+                        <td style={{ fontSize: 12, color: 'var(--muted)' }}>
+                          {first.referenceType ?? '—'}
+                        </td>
+                        <td style={{ fontSize: 13 }}>{first.note ?? '—'}</td>
+                      </tr>
+                      {isExpanded &&
+                        group.slices.map((slice) => (
+                          <tr key={slice.id} style={{ fontSize: 12, background: '#fcfcfd' }}>
+                            <td style={{ paddingLeft: 28, color: 'var(--muted)' }}>
+                              Slice #{slice.sliceIndex ?? 0}
+                            </td>
+                            <td colSpan={3} />
+                            <td>
+                              {slice.lotCode ? (
+                                <span className="badge">{slice.lotCode}</span>
+                              ) : (
+                                <span style={{ color: 'var(--muted)' }}>Unlotted</span>
+                              )}
+                            </td>
+                            <td
+                              style={{
+                                fontWeight: 600,
+                                color: slice.quantityDelta.startsWith('-')
+                                  ? 'var(--danger-text)'
+                                  : 'inherit',
+                              }}
+                            >
+                              {slice.quantityDelta.startsWith('-')
+                                ? slice.quantityDelta
+                                : `+${slice.quantityDelta}`}
+                            </td>
+                            <td>
+                              {slice.unitCost !== undefined && slice.unitCost !== null
+                                ? slice.unitCost
+                                : '—'}
+                            </td>
+                            <td colSpan={3} style={{ color: 'var(--muted)' }}>
+                              {slice.wacUnitCost ? `WAC: ${slice.wacUnitCost}` : ''}
+                            </td>
+                          </tr>
+                        ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>

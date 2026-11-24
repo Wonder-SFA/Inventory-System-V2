@@ -2,7 +2,9 @@
 
 import {
   type Customer,
+  type FefoAllocationSlice,
   type Location,
+  type PlanFefoAllocationResult,
   type ReturnSalesOrderResult,
   SSE_TOPICS,
   type SalesOrder,
@@ -26,6 +28,7 @@ interface DraftLineState {
 
 interface ShipLineState {
   orderLineId: string;
+  skuId: string;
   skuLabel: string;
   orderedQty: string;
   fulfilledQty: string;
@@ -79,6 +82,8 @@ export default function SalesOrdersPage() {
   const [shippingOrder, setShippingOrder] = useState<SalesOrder | null>(null);
   const [shipNote, setShipNote] = useState('');
   const [shipLines, setShipLines] = useState<ShipLineState[]>([]);
+  const [fefoPreviews, setFefoPreviews] = useState<Record<string, FefoAllocationSlice[]>>({});
+  const [lastAllocatedSummary, setLastAllocatedSummary] = useState<string | null>(null);
   const [shipping, setShipping] = useState(false);
 
   // Return state
@@ -278,22 +283,51 @@ export default function SalesOrdersPage() {
     }
   }
 
+  const loadFefoPreviewForLine = useCallback(
+    async (orderLineId: string, skuId: string, locId: string, quantity: string) => {
+      const sku = skus.find((s) => s.id === skuId);
+      if (!sku?.trackLots || Number(quantity) <= 0) {
+        setFefoPreviews((prev) => ({ ...prev, [orderLineId]: [] }));
+        return;
+      }
+      try {
+        const params = new URLSearchParams({
+          skuId,
+          locationId: locId,
+          quantity: quantity.trim(),
+        });
+        const res = await apiFetch<PlanFefoAllocationResult>(
+          `/api/v1/stock-lots/fefo-preview?${params.toString()}`,
+        );
+        setFefoPreviews((prev) => ({ ...prev, [orderLineId]: res.data.slices }));
+      } catch {
+        setFefoPreviews((prev) => ({ ...prev, [orderLineId]: [] }));
+      }
+    },
+    [skus],
+  );
+
   function openShipModal(so: SalesOrder) {
     setReturningOrder(null);
     setShippingOrder(so);
     setShipNote('');
-    setShipLines(
-      so.lines.map((line) => {
-        const remaining = Math.max(0, Number(line.orderedQty) - Number(line.fulfilledQty));
-        return {
-          orderLineId: line.id,
-          skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName ?? ''}` : line.skuId,
-          orderedQty: line.orderedQty,
-          fulfilledQty: line.fulfilledQty,
-          quantity: remaining > 0 ? remaining.toFixed(4) : '0.0000',
-        };
-      }),
-    );
+    setLastAllocatedSummary(null);
+    const initialLines = so.lines.map((line) => {
+      const remaining = Math.max(0, Number(line.orderedQty) - Number(line.fulfilledQty));
+      return {
+        orderLineId: line.id,
+        skuId: line.skuId,
+        skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName ?? ''}` : line.skuId,
+        orderedQty: line.orderedQty,
+        fulfilledQty: line.fulfilledQty,
+        quantity: remaining > 0 ? remaining.toFixed(4) : '0.0000',
+      };
+    });
+    setShipLines(initialLines);
+    setFefoPreviews({});
+    for (const line of initialLines) {
+      void loadFefoPreviewForLine(line.orderLineId, line.skuId, so.locationId, line.quantity);
+    }
     setError(null);
     setWarnings([]);
   }
@@ -329,6 +363,14 @@ export default function SalesOrdersPage() {
       );
       if (res.warnings && res.warnings.length > 0) {
         setWarnings(res.warnings.map((w) => w.message));
+      }
+      const lotSlices = res.data.movements.filter((m) => m.lotCode || m.movementGroupId);
+      if (lotSlices.length > 0) {
+        setLastAllocatedSummary(
+          lotSlices
+            .map((m) => `${m.lotCode ?? 'Unlotted'} (${m.quantityDelta})`)
+            .join(', '),
+        );
       }
       setShippingOrder(null);
       await loadOrders(statusFilter);
@@ -449,6 +491,22 @@ export default function SalesOrdersPage() {
                 <li key={idx}>{w}</li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {lastAllocatedSummary && (
+          <div
+            role="status"
+            style={{
+              background: '#ecfdf5',
+              border: '1px solid #10b981',
+              color: '#065f46',
+              padding: '10px 14px',
+              borderRadius: 8,
+              fontSize: 13,
+            }}
+          >
+            <strong>Dispatched Lot Allocations:</strong> {lastAllocatedSummary}
           </div>
         )}
 
@@ -624,29 +682,60 @@ export default function SalesOrdersPage() {
                     <th>Ordered</th>
                     <th>Fulfilled</th>
                     <th>Ship Qty</th>
+                    <th>FEFO Lot Preview</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {shipLines.map((line, idx) => (
-                    <tr key={line.orderLineId}>
-                      <td>{line.skuLabel}</td>
-                      <td>{line.orderedQty}</td>
-                      <td>{line.fulfilledQty}</td>
-                      <td>
-                        <input
-                          type="text"
-                          value={line.quantity}
-                          onChange={(e) =>
-                            setShipLines((prev) =>
-                              prev.map((l, i) =>
-                                i === idx ? { ...l, quantity: e.target.value } : l,
-                              ),
-                            )
-                          }
-                        />
-                      </td>
-                    </tr>
-                  ))}
+                  {shipLines.map((line, idx) => {
+                    const previewSlices = fefoPreviews[line.orderLineId] ?? [];
+                    return (
+                      <tr key={line.orderLineId}>
+                        <td>{line.skuLabel}</td>
+                        <td>{line.orderedQty}</td>
+                        <td>{line.fulfilledQty}</td>
+                        <td>
+                          <input
+                            type="text"
+                            value={line.quantity}
+                            onChange={(e) => {
+                              const nextQty = e.target.value;
+                              setShipLines((prev) =>
+                                prev.map((l, i) =>
+                                  i === idx ? { ...l, quantity: nextQty } : l,
+                                ),
+                              );
+                              if (shippingOrder) {
+                                void loadFefoPreviewForLine(
+                                  line.orderLineId,
+                                  line.skuId,
+                                  shippingOrder.locationId,
+                                  nextQty,
+                                );
+                              }
+                            }}
+                          />
+                        </td>
+                        <td style={{ fontSize: 12 }}>
+                          {previewSlices.length === 0 ? (
+                            <span style={{ color: 'var(--muted)' }}>—</span>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                              {previewSlices.map((s, sIdx) => (
+                                <div key={sIdx}>
+                                  <span className="badge">
+                                    {s.lotCode ?? (s.negativeStockWarning ? 'Shortfall' : 'Unlotted')}
+                                  </span>{' '}
+                                  × {s.quantity}
+                                  {s.expDate ? ` (exp ${s.expDate})` : ''}
+                                  {s.negativeStockWarning ? ' ⚠ Negative stock' : ''}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
               <div style={{ display: 'flex', gap: 8 }}>
