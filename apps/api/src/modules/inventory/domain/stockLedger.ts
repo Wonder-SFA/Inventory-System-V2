@@ -4,11 +4,16 @@ import {
   BadRequestError,
   type Decimal4,
   ERROR_CODES,
+  type FefoCandidateLot,
+  type FefoPreviewQuery,
   type ListStockBalancesQuery,
   type ListStockMovementsQuery,
   type LotInput,
+  type LotNegativeStockPolicy,
+  type LotPickingMode,
   type Money,
   NotFoundError,
+  type PlanFefoAllocationResult,
   type Quantity,
   type StockBalance,
   type StockMovement,
@@ -18,6 +23,7 @@ import {
   type ValuationStatus,
   ValidationError,
   ZERO_DECIMAL4,
+  abs,
   add,
   calculateBlendedLotCost,
   calculateWeightedAverageCost,
@@ -29,6 +35,7 @@ import {
   isZeroOrNegative,
   mul,
   negate,
+  planFefoAllocation,
   round4,
   sub,
   toMoney,
@@ -87,6 +94,10 @@ export interface PostMovementLine {
   skuId: UUID;
   locationId: UUID;
   lotInput?: LotInput | undefined;
+  lotId?: UUID | null | undefined;
+  pickingMode?: LotPickingMode | undefined;
+  negativeStockPolicy?: LotNegativeStockPolicy | undefined;
+  today?: string | undefined;
   sliceIndex?: number | undefined;
   movementGroupId?: UUID | null | undefined;
   quantityDelta: Quantity;
@@ -528,6 +539,79 @@ async function upsertAndUpdateStockLot(
   return { lotId, lotCode };
 }
 
+interface LockedLotBalanceEntry {
+  lotId: string;
+  skuId: string;
+  lotCode: string;
+  expDate: string | null;
+  createdAt: string;
+  locationId: string;
+  onHand: Quantity;
+  unitCost: UnitCost;
+}
+
+async function lockLotBalancesForPairs(
+  tx: DbTransaction,
+  pairs: readonly StockPair[],
+): Promise<Map<string, LockedLotBalanceEntry[]>> {
+  const sortedPairs = sortUniquePairs(pairs);
+  if (sortedPairs.length === 0) {
+    return new Map();
+  }
+
+  const skuIds = [...new Set(sortedPairs.map((p) => p.skuId))];
+  const locationIds = [...new Set(sortedPairs.map((p) => p.locationId))];
+  const lotRows = await tx
+    .select()
+    .from(stockLots)
+    .where(inArray(stockLots.skuId, skuIds));
+
+  if (lotRows.length === 0) {
+    return new Map();
+  }
+
+  const lotById = new Map(lotRows.map((l) => [l.id, l]));
+  const lotIds = lotRows.map((l) => l.id);
+
+  // Deterministic lock ordering: (lot_id, location_id) ascending
+  const lockedBalances = await tx
+    .select()
+    .from(stockLotBalances)
+    .where(
+      and(
+        inArray(stockLotBalances.lotId, lotIds),
+        inArray(stockLotBalances.locationId, locationIds),
+      ),
+    )
+    .orderBy(asc(stockLotBalances.lotId), asc(stockLotBalances.locationId))
+    .for('update');
+
+  const allowedPairKeys = new Set(sortedPairs.map((p) => pairKey(p.skuId, p.locationId)));
+  const result = new Map<string, LockedLotBalanceEntry[]>();
+
+  for (const bal of lockedBalances) {
+    const lot = lotById.get(bal.lotId);
+    if (!lot) continue;
+    const key = pairKey(lot.skuId, bal.locationId);
+    if (!allowedPairKeys.has(key)) continue;
+
+    const list = result.get(key) ?? [];
+    list.push({
+      lotId: lot.id,
+      skuId: lot.skuId,
+      lotCode: lot.lotCode,
+      expDate: lot.expDate ?? null,
+      createdAt: lot.createdAt.toISOString(),
+      locationId: bal.locationId,
+      onHand: toQuantity(bal.onHand),
+      unitCost: toUnitCost(bal.unitCost),
+    });
+    result.set(key, list);
+  }
+
+  return result;
+}
+
 export async function postMovements(
   tx: DbTransaction,
   lines: readonly PostMovementLine[],
@@ -549,19 +633,91 @@ export async function postMovements(
     }
   }
 
-  const uniqueSkuIds = [...new Set(lines.map((l) => l.skuId))];
+  // Composite idempotency replay check by idempotency_key (returning all ordered slices)
+  const uniqueIdemKeys = [...new Set(lines.map((l) => l.idempotencyKey))];
+  const existingRows = await tx
+    .select()
+    .from(stockMovements)
+    .where(inArray(stockMovements.idempotencyKey, uniqueIdemKeys))
+    .orderBy(asc(stockMovements.idempotencyKey), asc(stockMovements.sliceIndex));
+
+  const existingByKey = new Map<string, StockMovementRow[]>();
+  for (const row of existingRows) {
+    const list = existingByKey.get(row.idempotencyKey) ?? [];
+    list.push(row);
+    existingByKey.set(row.idempotencyKey, list);
+  }
+
+  const existingLotIds = [
+    ...new Set(existingRows.map((r) => r.lotId).filter((id): id is string => id !== null)),
+  ];
+  const existingLotCodeMap = new Map<string, string>();
+  if (existingLotIds.length > 0) {
+    const lots = await tx
+      .select({ id: stockLots.id, lotCode: stockLots.lotCode })
+      .from(stockLots)
+      .where(inArray(stockLots.id, existingLotIds));
+    for (const lot of lots) {
+      existingLotCodeMap.set(lot.id, lot.lotCode);
+    }
+  }
+
+  const newLines = lines.filter((l) => !existingByKey.has(l.idempotencyKey));
+  if (newLines.length === 0) {
+    const replayedMovements: StockMovement[] = [];
+    for (const line of lines) {
+      const rows = existingByKey.get(line.idempotencyKey) ?? [];
+      for (const row of rows) {
+        const lotCode = row.lotId ? (existingLotCodeMap.get(row.lotId) ?? null) : null;
+        replayedMovements.push(toStockMovementDto(row, undefined, undefined, lotCode));
+      }
+    }
+    const balanceMap = await upsertAndLockBalances(
+      tx,
+      lines.map((l) => ({ skuId: l.skuId, locationId: l.locationId })),
+    );
+    return {
+      movements: replayedMovements,
+      balances: [...balanceMap.values()],
+      warnings: [],
+    };
+  }
+
+  const uniqueSkuIds = [...new Set(newLines.map((l) => l.skuId))];
   const skus = await getSkusByIds(tx, uniqueSkuIds);
   const skuMap = new Map(skus.map((s) => [s.id, s]));
 
+  // Lock 1: stock_balances sorted by (sku_id, location_id)
   const map = await upsertAndLockBalances(
     tx,
     lines.map((l) => ({ skuId: l.skuId, locationId: l.locationId })),
   );
+
+  // Lock 2: stock_lot_balances sorted by (lot_id, location_id) for lot-tracked outbound issues
+  const fefoPairs = newLines
+    .filter(
+      (l) =>
+        l.type === 'ISSUE' &&
+        isNegative(l.quantityDelta) &&
+        skuMap.get(l.skuId)?.trackLots === true,
+    )
+    .map((l) => ({ skuId: l.skuId, locationId: l.locationId }));
+  const lockedLotMap = await lockLotBalancesForPairs(tx, fefoPairs);
+
   const dirtyKeys = new Set<string>();
   const warnings: ApiWarning[] = [];
   const insertedMovements: StockMovement[] = [];
 
   for (const line of lines) {
+    const replayedRows = existingByKey.get(line.idempotencyKey);
+    if (replayedRows) {
+      for (const row of replayedRows) {
+        const lotCode = row.lotId ? (existingLotCodeMap.get(row.lotId) ?? null) : null;
+        insertedMovements.push(toStockMovementDto(row, undefined, undefined, lotCode));
+      }
+      continue;
+    }
+
     const key = pairKey(line.skuId, line.locationId);
     const state = map.get(key)!;
     const oldQty = state.onHand;
@@ -584,6 +740,223 @@ export async function postMovements(
       }
     }
 
+    const effectiveCurrency = line.currency ?? state.currency ?? 'USD';
+
+    // Outbound ISSUE on lot-tracked SKU without explicit lotInput -> apply pickingMode / FEFO
+    if (
+      line.type === 'ISSUE' &&
+      isNegative(line.quantityDelta) &&
+      sku?.trackLots &&
+      !line.lotInput?.lotCode?.trim()
+    ) {
+      const pickingMode: LotPickingMode = line.pickingMode ?? 'AUTO_FEFO';
+
+      if (pickingMode === 'MANUAL_REQUIRED' && !line.lotId) {
+        throw new ValidationError(
+          ERROR_CODES.LOT_CODE_REQUIRED,
+          `Manual lot selection is required when issuing lot-tracked SKU ${sku.code}`,
+        );
+      }
+
+      if (pickingMode === 'MANUAL_OPTIONAL' && !line.lotId) {
+        const recordedUnitCost = line.unitCost ?? oldWac;
+        const recordedWacUnitCost = oldWac;
+        state.onHand = newQty;
+        state.available = sub(state.onHand, state.reserved);
+        if (line.currency) state.currency = line.currency;
+        dirtyKeys.add(key);
+
+        const [row] = await tx
+          .insert(stockMovements)
+          .values({
+            id: line.id ?? uuidv7(),
+            type: line.type,
+            skuId: line.skuId,
+            locationId: line.locationId,
+            lotId: null,
+            sliceIndex: line.sliceIndex ?? 0,
+            movementGroupId: line.movementGroupId ?? null,
+            quantityDelta: line.quantityDelta,
+            unitCost: recordedUnitCost,
+            wacUnitCost: recordedWacUnitCost,
+            currency: effectiveCurrency,
+            reasonCategory: line.reasonCategory ?? null,
+            note: line.note ?? null,
+            referenceType: line.referenceType ?? null,
+            referenceId: line.referenceId ?? null,
+            actorId: line.actorId,
+            idempotencyKey: line.idempotencyKey,
+          })
+          .returning();
+
+        const dto = toStockMovementDto(row!, undefined, undefined, null);
+        insertedMovements.push(dto);
+        warnings.push(...collectStockWarnings(state));
+        await emitOutboxEvent(tx, options?.emit, {
+          eventType: eventTypeForMovement(line.type),
+          aggregateType: 'stock_movement',
+          aggregateId: dto.id,
+          payload: dto,
+        });
+        continue;
+      }
+
+      if (line.lotId) {
+        const lotEntries = lockedLotMap.get(key) ?? [];
+        const entry = lotEntries.find((e) => e.lotId === line.lotId);
+        if (!entry) {
+          throw new NotFoundError(
+            ERROR_CODES.NOT_FOUND,
+            `Stock lot ${line.lotId} not found at location ${line.locationId}`,
+          );
+        }
+        entry.onHand = add(entry.onHand, line.quantityDelta);
+        await tx
+          .update(stockLotBalances)
+          .set({ onHand: entry.onHand, updatedAt: new Date() })
+          .where(
+            and(
+              eq(stockLotBalances.lotId, entry.lotId),
+              eq(stockLotBalances.locationId, line.locationId),
+            ),
+          );
+
+        const recordedUnitCost = entry.unitCost;
+        const recordedWacUnitCost = oldWac;
+        state.onHand = newQty;
+        state.available = sub(state.onHand, state.reserved);
+        if (line.currency) state.currency = line.currency;
+        dirtyKeys.add(key);
+
+        const [row] = await tx
+          .insert(stockMovements)
+          .values({
+            id: line.id ?? uuidv7(),
+            type: line.type,
+            skuId: line.skuId,
+            locationId: line.locationId,
+            lotId: entry.lotId,
+            sliceIndex: line.sliceIndex ?? 0,
+            movementGroupId: line.movementGroupId ?? null,
+            quantityDelta: line.quantityDelta,
+            unitCost: recordedUnitCost,
+            wacUnitCost: recordedWacUnitCost,
+            currency: effectiveCurrency,
+            reasonCategory: line.reasonCategory ?? null,
+            note: line.note ?? null,
+            referenceType: line.referenceType ?? null,
+            referenceId: line.referenceId ?? null,
+            actorId: line.actorId,
+            idempotencyKey: line.idempotencyKey,
+          })
+          .returning();
+
+        const dto = toStockMovementDto(row!, undefined, undefined, entry.lotCode);
+        insertedMovements.push(dto);
+        warnings.push(...collectStockWarnings(state));
+        await emitOutboxEvent(tx, options?.emit, {
+          eventType: eventTypeForMovement(line.type),
+          aggregateType: 'stock_movement',
+          aggregateId: dto.id,
+          payload: dto,
+        });
+        continue;
+      }
+
+      // AUTO_FEFO allocation
+      const lotEntries = lockedLotMap.get(key) ?? [];
+      let totalSlottedOnHand = toQuantity(ZERO_DECIMAL4);
+      for (const entry of lotEntries) {
+        totalSlottedOnHand = add(totalSlottedOnHand, entry.onHand);
+      }
+      const unlottedOnHand = sub(oldQty, totalSlottedOnHand);
+      const positiveUnlottedQty = isPositive(unlottedOnHand)
+        ? unlottedOnHand
+        : toQuantity(ZERO_DECIMAL4);
+
+      const candidates: FefoCandidateLot[] = lotEntries.map((e) => ({
+        lotId: e.lotId,
+        lotCode: e.lotCode,
+        expDate: e.expDate,
+        createdAt: e.createdAt,
+        onHand: e.onHand,
+        unitCost: e.unitCost,
+      }));
+
+      const today = line.today ?? new Date().toISOString().slice(0, 10);
+      const plan = planFefoAllocation({
+        requestedQty: abs(line.quantityDelta),
+        positiveUnlottedQty,
+        lots: candidates,
+        today,
+        negativeStockPolicy: line.negativeStockPolicy ?? 'FLEXIBLE_UNASSIGNED',
+      });
+
+      const groupId = line.movementGroupId ?? uuidv7();
+      const lotEntryById = new Map(lotEntries.map((e) => [e.lotId, e]));
+
+      state.onHand = newQty;
+      state.available = sub(state.onHand, state.reserved);
+      if (line.currency) state.currency = line.currency;
+      dirtyKeys.add(key);
+
+      for (let idx = 0; idx < plan.slices.length; idx++) {
+        const slice = plan.slices[idx]!;
+        if (slice.lotId !== null) {
+          const entry = lotEntryById.get(slice.lotId)!;
+          entry.onHand = sub(entry.onHand, slice.quantity);
+          await tx
+            .update(stockLotBalances)
+            .set({ onHand: entry.onHand, updatedAt: new Date() })
+            .where(
+              and(
+                eq(stockLotBalances.lotId, entry.lotId),
+                eq(stockLotBalances.locationId, line.locationId),
+              ),
+            );
+        }
+
+        const recordedUnitCost = slice.unitCost ?? line.unitCost ?? oldWac;
+        const recordedWacUnitCost = oldWac;
+
+        const [row] = await tx
+          .insert(stockMovements)
+          .values({
+            id: idx === 0 && line.id ? line.id : uuidv7(),
+            type: line.type,
+            skuId: line.skuId,
+            locationId: line.locationId,
+            lotId: slice.lotId,
+            sliceIndex: idx,
+            movementGroupId: groupId,
+            quantityDelta: negate(slice.quantity),
+            unitCost: recordedUnitCost,
+            wacUnitCost: recordedWacUnitCost,
+            currency: effectiveCurrency,
+            reasonCategory: line.reasonCategory ?? null,
+            note: line.note ?? null,
+            referenceType: line.referenceType ?? null,
+            referenceId: line.referenceId ?? null,
+            actorId: line.actorId,
+            idempotencyKey: line.idempotencyKey,
+          })
+          .returning();
+
+        const dto = toStockMovementDto(row!, undefined, undefined, slice.lotCode);
+        insertedMovements.push(dto);
+
+        await emitOutboxEvent(tx, options?.emit, {
+          eventType: eventTypeForMovement(line.type),
+          aggregateType: 'stock_movement',
+          aggregateId: dto.id,
+          payload: dto,
+        });
+      }
+
+      warnings.push(...collectStockWarnings(state));
+      continue;
+    }
+
     let recordedUnitCost: UnitCost | null = line.unitCost ?? null;
     const isPositiveInbound =
       line.type === 'RECEIPT' ||
@@ -599,7 +972,6 @@ export async function postMovements(
     }
 
     const recordedWacUnitCost: UnitCost = state.weightedAverageCost;
-    const effectiveCurrency = line.currency ?? state.currency ?? 'USD';
 
     let lotId: string | null = null;
     let lotCode: string | undefined;
@@ -1419,6 +1791,60 @@ export function registerInventoryReferenceCheckers(): void {
   registerSkuPositiveStockChecker(hasInventoryPositiveOnHandStock);
   registerLocationReferenceChecker(hasInventoryLocationReferences);
   referenceCheckersRegistered = true;
+}
+
+export async function previewFefoAllocation(
+  db: Database | DbTransaction,
+  query: FefoPreviewQuery,
+  negativeStockPolicy: LotNegativeStockPolicy = 'FLEXIBLE_UNASSIGNED',
+): Promise<PlanFefoAllocationResult> {
+  const [bal] = await db
+    .select({ onHand: stockBalances.onHand })
+    .from(stockBalances)
+    .where(and(eq(stockBalances.skuId, query.skuId), eq(stockBalances.locationId, query.locationId)))
+    .limit(1);
+
+  const totalOnHand = bal ? toQuantity(bal.onHand) : toQuantity(ZERO_DECIMAL4);
+
+  const lotRows = await db
+    .select({
+      lotId: stockLots.id,
+      lotCode: stockLots.lotCode,
+      expDate: stockLots.expDate,
+      createdAt: stockLots.createdAt,
+      onHand: stockLotBalances.onHand,
+      unitCost: stockLotBalances.unitCost,
+    })
+    .from(stockLotBalances)
+    .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
+    .where(and(eq(stockLots.skuId, query.skuId), eq(stockLotBalances.locationId, query.locationId)));
+
+  let totalSlotted = toQuantity(ZERO_DECIMAL4);
+  const candidates: FefoCandidateLot[] = [];
+  for (const row of lotRows) {
+    const qty = toQuantity(row.onHand);
+    totalSlotted = add(totalSlotted, qty);
+    candidates.push({
+      lotId: row.lotId,
+      lotCode: row.lotCode,
+      expDate: row.expDate ?? null,
+      createdAt: row.createdAt.toISOString(),
+      onHand: qty,
+      unitCost: toUnitCost(row.unitCost),
+    });
+  }
+
+  const unlotted = sub(totalOnHand, totalSlotted);
+  const positiveUnlottedQty = isPositive(unlotted) ? unlotted : toQuantity(ZERO_DECIMAL4);
+  const today = query.today ?? new Date().toISOString().slice(0, 10);
+
+  return planFefoAllocation({
+    requestedQty: query.quantity,
+    positiveUnlottedQty,
+    lots: candidates,
+    today,
+    negativeStockPolicy,
+  });
 }
 
 // Keep unused gte import check clean if not needed

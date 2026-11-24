@@ -448,6 +448,10 @@ export async function shipSalesOrder(
     actorId: string;
     deriveLineIdempotencyKey: (lineId: string) => UUID;
     emit?: OrderEmitEventFn;
+    resolveLotPolicy?: (locationId: string) => {
+      pickingMode: 'AUTO_FEFO' | 'MANUAL_REQUIRED' | 'MANUAL_OPTIONAL';
+      negativeStockPolicy: 'FLEXIBLE_UNASSIGNED' | 'STRICT_BLOCK';
+    };
   },
 ): Promise<{ result: ShipSalesOrderResult; warnings: ApiWarning[] }> {
   const [so] = await tx
@@ -522,6 +526,7 @@ export async function shipSalesOrder(
 
   await releaseReservation(tx, releaseLines, { emit: options.emit });
 
+  const lotPolicy = options.resolveLotPolicy ? options.resolveLotPolicy(so.locationId) : undefined;
   const lineOccurrenceCount = new Map<string, number>();
   const movementLines: PostMovementLine[] = input.lines.map((reqLine) => {
     const line = lineById.get(reqLine.orderLineId)!;
@@ -533,6 +538,8 @@ export async function shipSalesOrder(
       type: 'ISSUE',
       skuId: line.skuId,
       locationId: so.locationId,
+      pickingMode: lotPolicy?.pickingMode,
+      negativeStockPolicy: lotPolicy?.negativeStockPolicy,
       quantityDelta: negate(reqLine.quantity) as Quantity,
       currency: line.currency,
       note: input.note ?? null,

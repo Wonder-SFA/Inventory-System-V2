@@ -229,6 +229,7 @@ export function registerSalesOrderRoutes(
               actorId: policy.actor.id,
               deriveLineIdempotencyKey: ctx.deriveLineIdempotencyKey,
               emit: ctx.emit,
+              resolveLotPolicy: (locationId) => policy.resolveLotPolicy({ locationId }),
             });
             return {
               data: policy.redactCosts(shipped.result),

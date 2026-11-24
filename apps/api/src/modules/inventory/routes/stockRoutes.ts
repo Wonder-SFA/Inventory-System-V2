@@ -1,6 +1,7 @@
 import type { Database } from '@iv2/db';
 import {
   CreateStockAdjustmentInputSchema,
+  FefoPreviewQuerySchema,
   ListStockBalancesQuerySchema,
   ListStockMovementsQuerySchema,
   uuidv7,
@@ -11,6 +12,7 @@ import { type OutboxDispatcher, executeCommand } from '../../../shared/index.js'
 import {
   listStockBalances,
   listStockMovements,
+  previewFefoAllocation,
   recordManualAdjustment,
 } from '../domain/index.js';
 
@@ -69,6 +71,31 @@ export function registerStockRoutes(
           nextCursor: result.nextCursor,
           hasMore: result.hasMore,
         },
+        meta: {
+          requestId: request.id,
+        },
+      };
+    },
+  );
+
+  typedApp.get(
+    '/api/v1/stock-lots/fefo-preview',
+    {
+      schema: {
+        querystring: FefoPreviewQuerySchema,
+      },
+    },
+    async (request) => {
+      const policy = request.accessPolicy!;
+      policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
+      const lotPolicy = policy.resolveLotPolicy({ locationId: request.query.locationId });
+      const preview = await previewFefoAllocation(
+        db,
+        request.query,
+        lotPolicy.negativeStockPolicy,
+      );
+      return {
+        data: policy.redactCosts(preview),
         meta: {
           requestId: request.id,
         },

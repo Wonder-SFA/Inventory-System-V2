@@ -11,6 +11,7 @@ import {
 } from '../decimal/index.js';
 import { CursorPaginationQuerySchema } from '../http/index.js';
 
+export * from './fefo.js';
 export const StockMovementTypeSchema = z.enum([
   'RECEIPT',
   'ISSUE',
@@ -257,3 +258,30 @@ export const ListStockMovementsQuerySchema = CursorPaginationQuerySchema.extend(
   referenceId: z.string().uuid().optional(),
 });
 export type ListStockMovementsQuery = z.infer<typeof ListStockMovementsQuerySchema>;
+
+export interface FefoPreviewQuery {
+  skuId: string;
+  locationId: string;
+  quantity: Quantity;
+  today?: string | undefined;
+}
+
+export interface FefoPreviewRawQuery {
+  skuId: string;
+  locationId: string;
+  quantity: string;
+  today?: string | undefined;
+}
+
+export const FefoPreviewQuerySchema: z.ZodType<
+  FefoPreviewQuery,
+  z.ZodTypeDef,
+  FefoPreviewRawQuery
+> = z.object({
+  skuId: z.string().uuid(),
+  locationId: z.string().uuid(),
+  quantity: zQuantity.refine((val) => !isZero(val) && !isNegative(val), {
+    message: 'Preview quantity must be greater than zero',
+  }),
+  today: zIsoDate.optional(),
+});
