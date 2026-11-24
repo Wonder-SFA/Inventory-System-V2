@@ -11,7 +11,14 @@ import {
   zUnitCost,
 } from '../decimal/index.js';
 import { CursorPaginationQuerySchema } from '../http/index.js';
+import {
+  DEFAULT_EXPIRING_SOON_DAYS,
+  type ExpiryStatus,
+  ExpiryStatusFilterSchema,
+  ExpiryStatusSchema,
+} from './expiry.js';
 
+export * from './expiry.js';
 export * from './fefo.js';
 export const StockMovementTypeSchema = z.enum([
   'RECEIPT',
@@ -270,6 +277,9 @@ export type ValuationStatus = z.infer<typeof ValuationStatusSchema>;
 export const StockBalanceViewSchema = z.enum(['per-location', 'company-wide']);
 export type StockBalanceView = z.infer<typeof StockBalanceViewSchema>;
 
+export const ValuationCostBasisSchema = z.enum(['FIFO', 'WAC']);
+export type ValuationCostBasis = z.infer<typeof ValuationCostBasisSchema>;
+
 export interface StockBalance {
   skuId: string;
   skuCode: string;
@@ -281,8 +291,12 @@ export interface StockBalance {
   available: Quantity;
   inTransit: Quantity;
   unlottedOnHand?: Quantity | undefined;
+  costBasis?: ValuationCostBasis | undefined;
+  unitCost?: UnitCost | undefined;
   weightedAverageCost?: UnitCost | undefined;
   totalValue?: Money | undefined;
+  fifoValue?: Money | undefined;
+  wacValue?: Money | undefined;
   sellingPrice: Money | null;
   grossMargin?: Money | null | undefined;
   grossMarginPercent?: string | null | undefined;
@@ -303,8 +317,12 @@ export const StockBalanceSchema: z.ZodType<StockBalance, z.ZodTypeDef, unknown> 
   available: zQuantity,
   inTransit: zQuantity,
   unlottedOnHand: zQuantity.optional(),
+  costBasis: ValuationCostBasisSchema.optional(),
+  unitCost: zUnitCost.optional(),
   weightedAverageCost: zUnitCost.optional(),
   totalValue: zMoney.optional(),
+  fifoValue: zMoney.optional(),
+  wacValue: zMoney.optional(),
   sellingPrice: zMoney.nullable(),
   grossMargin: zMoney.nullable().optional(),
   grossMarginPercent: z.string().nullable().optional(),
@@ -325,6 +343,7 @@ export const ListStockBalancesQuerySchema = CursorPaginationQuerySchema.extend({
   skuId: z.string().uuid().optional(),
   zeroOrNegativeOnly: zBooleanQueryParam.optional(),
   view: StockBalanceViewSchema.default('per-location'),
+  costBasis: ValuationCostBasisSchema.default('FIFO'),
 });
 export type ListStockBalancesQuery = z.infer<typeof ListStockBalancesQuerySchema>;
 
@@ -448,4 +467,127 @@ export const AssignOpeningLotsInputSchema: z.ZodType<
   currency: z.string().trim().length(3).toUpperCase().default('USD'),
   note: z.string().trim().max(1000).nullable().optional(),
   lots: z.array(AssignOpeningLotLineInputSchema).min(1).max(100),
+});
+
+export const ListStockLotsQuerySchema = CursorPaginationQuerySchema.extend({
+  locationId: z.string().uuid().optional(),
+  skuId: z.string().uuid().optional(),
+  expiryStatus: ExpiryStatusFilterSchema.optional(),
+  expiringWithinDays: z.coerce.number().int().min(1).max(365).default(DEFAULT_EXPIRING_SOON_DAYS),
+  today: zIsoDate.optional(),
+});
+export type ListStockLotsQuery = z.infer<typeof ListStockLotsQuerySchema>;
+
+export interface StockLotView {
+  id: string;
+  skuId: string;
+  skuCode: string;
+  skuName: string;
+  lotCode: string;
+  mfgDate: string | null;
+  expDate: string | null;
+  expiryStatus: ExpiryStatus;
+  totalOnHand: Quantity;
+  totalInTransit: Quantity;
+  createdAt: string;
+}
+
+export const StockLotViewSchema: z.ZodType<StockLotView, z.ZodTypeDef, unknown> = z.object({
+  id: z.string().uuid(),
+  skuId: z.string().uuid(),
+  skuCode: z.string(),
+  skuName: z.string(),
+  lotCode: z.string().min(1),
+  mfgDate: zIsoDate.nullable(),
+  expDate: zIsoDate.nullable(),
+  expiryStatus: ExpiryStatusSchema,
+  totalOnHand: zQuantity,
+  totalInTransit: zQuantity,
+  createdAt: z.string(),
+});
+
+export const ListLotBalancesQuerySchema = CursorPaginationQuerySchema.extend({
+  locationId: z.string().uuid().optional(),
+  skuId: z.string().uuid().optional(),
+  expiryStatus: ExpiryStatusFilterSchema.optional(),
+  expiringWithinDays: z.coerce.number().int().min(1).max(365).default(DEFAULT_EXPIRING_SOON_DAYS),
+  today: zIsoDate.optional(),
+});
+export type ListLotBalancesQuery = z.infer<typeof ListLotBalancesQuerySchema>;
+
+export interface LotBalanceItem {
+  lotId: string;
+  skuId: string;
+  skuCode: string;
+  skuName: string;
+  lotCode: string;
+  mfgDate: string | null;
+  expDate: string | null;
+  expiryStatus: ExpiryStatus;
+  locationId: string;
+  locationName: string;
+  onHand: Quantity;
+  inTransit: Quantity;
+  unitCost?: UnitCost | undefined;
+  wacUnitCost?: UnitCost | undefined;
+  totalValue?: Money | undefined;
+  fifoValue?: Money | undefined;
+  wacValue?: Money | undefined;
+  currency: string;
+  updatedAt: string;
+}
+
+export const LotBalanceItemSchema: z.ZodType<LotBalanceItem, z.ZodTypeDef, unknown> = z.object({
+  lotId: z.string().uuid(),
+  skuId: z.string().uuid(),
+  skuCode: z.string(),
+  skuName: z.string(),
+  lotCode: z.string().min(1),
+  mfgDate: zIsoDate.nullable(),
+  expDate: zIsoDate.nullable(),
+  expiryStatus: ExpiryStatusSchema,
+  locationId: z.string().uuid(),
+  locationName: z.string(),
+  onHand: zQuantity,
+  inTransit: zQuantity,
+  unitCost: zUnitCost.optional(),
+  wacUnitCost: zUnitCost.optional(),
+  totalValue: zMoney.optional(),
+  fifoValue: zMoney.optional(),
+  wacValue: zMoney.optional(),
+  currency: z.string().length(3),
+  updatedAt: z.string(),
+});
+
+export const ValuationSummaryQuerySchema = z.object({
+  locationId: z.string().uuid().optional(),
+  skuId: z.string().uuid().optional(),
+  costBasis: ValuationCostBasisSchema.default('FIFO'),
+});
+export type ValuationSummaryQuery = z.infer<typeof ValuationSummaryQuerySchema>;
+
+export interface ValuationSummary {
+  costBasis: ValuationCostBasis;
+  currency: string;
+  skuCount: number;
+  locationCount: number;
+  rowCount: number;
+  totalOnHand: Quantity;
+  totalValue?: Money | undefined;
+  totalFifoValue?: Money | undefined;
+  totalWacValue?: Money | undefined;
+  estimatedNegativeCount: number;
+}
+
+export const ValuationSummarySchema: z.ZodType<ValuationSummary, z.ZodTypeDef, unknown> = z.object({
+  costBasis: ValuationCostBasisSchema,
+  currency: z.string().length(3),
+  skuCount: z.number().int().min(0),
+  locationCount: z.number().int().min(0),
+  rowCount: z.number().int().min(0),
+  totalOnHand: zQuantity,
+  totalValue: zMoney.optional(),
+  totalFifoValue: zMoney.optional(),
+  totalWacValue: zMoney.optional(),
+  estimatedNegativeCount: z.number().int().min(0),
 });

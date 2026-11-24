@@ -3,15 +3,20 @@ import {
   type ApiWarning,
   type AssignOpeningLotLineInput,
   BadRequestError,
+  DEFAULT_EXPIRING_SOON_DAYS,
   type Decimal4,
   ERROR_CODES,
+  type ExpiryStatusFilter,
   type FefoCandidateLot,
   type FefoPreviewQuery,
   ForbiddenError,
+  type ListLotBalancesQuery,
   type ListStockBalancesQuery,
   type ListStockLotBalancesQuery,
+  type ListStockLotsQuery,
   type ListStockMovementsQuery,
   type LotAllocationInput,
+  type LotBalanceItem,
   type LotInput,
   type LotNegativeStockPolicy,
   type LotPickingMode,
@@ -24,11 +29,15 @@ import {
   type RecentReceiptCostsResult,
   type StockBalance,
   type StockLotBalance,
+  type StockLotView,
   type StockMovement,
   type StockMovementType,
   type UUID,
   type UnitCost,
+  type ValuationCostBasis,
   type ValuationStatus,
+  type ValuationSummary,
+  type ValuationSummaryQuery,
   ValidationError,
   WARNING_CODES,
   ZERO_DECIMAL4,
@@ -36,8 +45,11 @@ import {
   add,
   calculateBlendedLotCost,
   calculateWeightedAverageCost,
+  computeExpiryStatus,
   div,
   formatDecimal4,
+  getExpiryCutoffDate,
+  getTodayUtcDate,
   isNegative,
   isPositive,
   isZero,
@@ -53,7 +65,22 @@ import {
   toUnitCost,
   uuidv7,
 } from '@iv2/shared-domain';
-import { type SQL, and, asc, desc, eq, gte, inArray, isNotNull, lte, or, sql } from 'drizzle-orm';
+import {
+  type SQL,
+  and,
+  asc,
+  desc,
+  eq,
+  exists,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  lt as drizzleLt,
+  lte,
+  or,
+  sql,
+} from 'drizzle-orm';
 import {
   type DbTransaction,
   type DomainEventInput,
@@ -2190,6 +2217,393 @@ export async function listStockLotBalances(
   }));
 }
 
+function buildExpiryStatusCondition(
+  expiryStatus: ExpiryStatusFilter | undefined,
+  today: string,
+  expiringWithinDays: number,
+): SQL | undefined {
+  if (!expiryStatus) {
+    return undefined;
+  }
+  const cutoff = getExpiryCutoffDate(today, expiringWithinDays);
+  if (expiryStatus === 'EXPIRED') {
+    return and(isNotNull(stockLots.expDate), drizzleLt(stockLots.expDate, today));
+  }
+  if (expiryStatus === 'EXPIRING_SOON') {
+    return and(
+      isNotNull(stockLots.expDate),
+      gte(stockLots.expDate, today),
+      lte(stockLots.expDate, cutoff),
+    );
+  }
+  return and(isNotNull(stockLots.expDate), gt(stockLots.expDate, cutoff));
+}
+
+function encodeLotBalanceCursor(lotId: string, locationId: string): string {
+  return Buffer.from(JSON.stringify({ l: lotId, loc: locationId }), 'utf8').toString('base64url');
+}
+
+function decodeLotBalanceCursor(cursor: string): { lotId: string; locationId: string } {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+      l?: unknown;
+      loc?: unknown;
+    };
+    if (typeof parsed.l !== 'string' || typeof parsed.loc !== 'string') {
+      throw new Error('Invalid cursor');
+    }
+    return { lotId: parsed.l, locationId: parsed.loc };
+  } catch {
+    throw new BadRequestError(ERROR_CODES.INVALID_CURSOR, 'Invalid pagination cursor');
+  }
+}
+
+export async function listStockLots(
+  db: Database,
+  scope: LocationScope,
+  query: ListStockLotsQuery,
+): Promise<{ items: StockLotView[]; nextCursor: string | null; hasMore: boolean }> {
+  const isAllLocations = 'allLocations' in scope && scope.allLocations;
+  if (!isAllLocations) {
+    if (!('locationIds' in scope) || scope.locationIds.length === 0) {
+      return { items: [], nextCursor: null, hasMore: false };
+    }
+    if (query.locationId && !scope.locationIds.includes(query.locationId)) {
+      return { items: [], nextCursor: null, hasMore: false };
+    }
+  }
+
+  const limit = query.limit ?? 50;
+  const today = query.today ?? getTodayUtcDate();
+  const expiringWithinDays = query.expiringWithinDays ?? DEFAULT_EXPIRING_SOON_DAYS;
+  const { orderBy, where: cursorWhere } = applyKeysetOrder(
+    stockLots.createdAt,
+    stockLots.id,
+    query.cursor,
+  );
+
+  const conditions: SQL[] = [];
+  if (query.skuId) {
+    conditions.push(eq(stockLots.skuId, query.skuId));
+  }
+  const expiryCondition = buildExpiryStatusCondition(query.expiryStatus, today, expiringWithinDays);
+  if (expiryCondition) {
+    conditions.push(expiryCondition);
+  }
+
+  const balanceScopeConditions: SQL[] = [eq(stockLotBalances.lotId, stockLots.id)];
+  if (query.locationId) {
+    balanceScopeConditions.push(eq(stockLotBalances.locationId, query.locationId));
+  } else if (!isAllLocations && 'locationIds' in scope) {
+    balanceScopeConditions.push(inArray(stockLotBalances.locationId, [...scope.locationIds]));
+  }
+
+  if (query.locationId || !isAllLocations) {
+    conditions.push(
+      exists(
+        db
+          .select({ lotId: stockLotBalances.lotId })
+          .from(stockLotBalances)
+          .where(and(...balanceScopeConditions)),
+      ),
+    );
+  }
+
+  if (cursorWhere) {
+    conditions.push(cursorWhere);
+  }
+
+  const rows = await db
+    .select()
+    .from(stockLots)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(...orderBy)
+    .limit(limit + 1);
+
+  const page = paginateKeysetResult(rows, limit);
+  if (page.items.length === 0) {
+    return { items: [], nextCursor: null, hasMore: false };
+  }
+
+  const skuIds = [...new Set(page.items.map((r) => r.skuId))];
+  const lotIds = page.items.map((r) => r.id);
+
+  const sumConditions: SQL[] = [inArray(stockLotBalances.lotId, lotIds)];
+  if (query.locationId) {
+    sumConditions.push(eq(stockLotBalances.locationId, query.locationId));
+  } else if (!isAllLocations && 'locationIds' in scope) {
+    sumConditions.push(inArray(stockLotBalances.locationId, [...scope.locationIds]));
+  }
+
+  const [skus, sumRows] = await Promise.all([
+    getSkusByIds(db, skuIds),
+    db
+      .select({
+        lotId: stockLotBalances.lotId,
+        totalOnHand: sql<string>`COALESCE(SUM(${stockLotBalances.onHand}), 0)`,
+        totalInTransit: sql<string>`COALESCE(SUM(${stockLotBalances.inTransit}), 0)`,
+      })
+      .from(stockLotBalances)
+      .where(and(...sumConditions))
+      .groupBy(stockLotBalances.lotId),
+  ]);
+
+  const skuMap = new Map(skus.map((s) => [s.id, s]));
+  const sumMap = new Map(
+    sumRows.map((s) => [
+      s.lotId,
+      { onHand: toQuantity(s.totalOnHand), inTransit: toQuantity(s.totalInTransit) },
+    ]),
+  );
+
+  return {
+    items: page.items.map((row) => {
+      const sku = skuMap.get(row.skuId);
+      const sums = sumMap.get(row.id);
+      return {
+        id: row.id,
+        skuId: row.skuId,
+        skuCode: sku?.code ?? row.skuId,
+        skuName: sku?.name ?? 'Unknown SKU',
+        lotCode: row.lotCode,
+        mfgDate: row.mfgDate ?? null,
+        expDate: row.expDate ?? null,
+        expiryStatus: computeExpiryStatus(row.expDate, { today, expiringWithinDays }),
+        totalOnHand: sums?.onHand ?? toQuantity(ZERO_DECIMAL4),
+        totalInTransit: sums?.inTransit ?? toQuantity(ZERO_DECIMAL4),
+        createdAt: row.createdAt.toISOString(),
+      };
+    }),
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+  };
+}
+
+export async function listLotBalances(
+  db: Database,
+  scope: LocationScope,
+  query: ListLotBalancesQuery,
+): Promise<{ items: LotBalanceItem[]; nextCursor: string | null; hasMore: boolean }> {
+  const isAllLocations = 'allLocations' in scope && scope.allLocations;
+  if (!isAllLocations) {
+    if (!('locationIds' in scope) || scope.locationIds.length === 0) {
+      return { items: [], nextCursor: null, hasMore: false };
+    }
+    if (query.locationId && !scope.locationIds.includes(query.locationId)) {
+      return { items: [], nextCursor: null, hasMore: false };
+    }
+  }
+
+  const limit = query.limit ?? 50;
+  const today = query.today ?? getTodayUtcDate();
+  const expiringWithinDays = query.expiringWithinDays ?? DEFAULT_EXPIRING_SOON_DAYS;
+  const conditions: SQL[] = [];
+
+  if (!isAllLocations && 'locationIds' in scope) {
+    conditions.push(inArray(stockLotBalances.locationId, [...scope.locationIds]));
+  }
+  if (query.locationId) {
+    conditions.push(eq(stockLotBalances.locationId, query.locationId));
+  }
+  if (query.skuId) {
+    conditions.push(eq(stockLots.skuId, query.skuId));
+  }
+  const expiryCondition = buildExpiryStatusCondition(query.expiryStatus, today, expiringWithinDays);
+  if (expiryCondition) {
+    conditions.push(expiryCondition);
+  }
+  if (query.cursor) {
+    const decoded = decodeLotBalanceCursor(query.cursor);
+    conditions.push(
+      or(
+        sql`${stockLotBalances.lotId} > ${decoded.lotId}`,
+        and(
+          eq(stockLotBalances.lotId, decoded.lotId),
+          sql`${stockLotBalances.locationId} > ${decoded.locationId}`,
+        ),
+      )!,
+    );
+  }
+
+  const rows = await db
+    .select({
+      lotId: stockLotBalances.lotId,
+      skuId: stockLots.skuId,
+      lotCode: stockLots.lotCode,
+      mfgDate: stockLots.mfgDate,
+      expDate: stockLots.expDate,
+      locationId: stockLotBalances.locationId,
+      locationName: locations.name,
+      onHand: stockLotBalances.onHand,
+      inTransit: stockLotBalances.inTransit,
+      unitCost: stockLotBalances.unitCost,
+      wacUnitCost: stockBalances.weightedAverageCost,
+      currency: stockLotBalances.currency,
+      updatedAt: stockLotBalances.updatedAt,
+    })
+    .from(stockLotBalances)
+    .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
+    .innerJoin(locations, eq(stockLotBalances.locationId, locations.id))
+    .leftJoin(
+      stockBalances,
+      and(
+        eq(stockBalances.skuId, stockLots.skuId),
+        eq(stockBalances.locationId, stockLotBalances.locationId),
+      ),
+    )
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(asc(stockLotBalances.lotId), asc(stockLotBalances.locationId))
+    .limit(limit + 1);
+
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  if (pageRows.length === 0) {
+    return { items: [], nextCursor: null, hasMore: false };
+  }
+
+  const skuIds = [...new Set(pageRows.map((r) => r.skuId))];
+  const skus = await getSkusByIds(db, skuIds);
+  const skuMap = new Map(skus.map((s) => [s.id, s]));
+
+  const items: LotBalanceItem[] = pageRows.map((row) => {
+    const sku = skuMap.get(row.skuId);
+    const onHand = toQuantity(row.onHand);
+    const unitCost = toUnitCost(row.unitCost);
+    const wacUnitCost = toUnitCost(row.wacUnitCost ?? row.unitCost);
+    const fifoValue = toMoney(mul(onHand, unitCost));
+    const wacValue = toMoney(mul(onHand, wacUnitCost));
+    return {
+      lotId: row.lotId,
+      skuId: row.skuId,
+      skuCode: sku?.code ?? row.skuId,
+      skuName: sku?.name ?? 'Unknown SKU',
+      lotCode: row.lotCode,
+      mfgDate: row.mfgDate ?? null,
+      expDate: row.expDate ?? null,
+      expiryStatus: computeExpiryStatus(row.expDate, { today, expiringWithinDays }),
+      locationId: row.locationId,
+      locationName: row.locationName,
+      onHand,
+      inTransit: toQuantity(row.inTransit),
+      unitCost,
+      wacUnitCost,
+      totalValue: fifoValue,
+      fifoValue,
+      wacValue,
+      currency: row.currency,
+      updatedAt: row.updatedAt.toISOString(),
+    };
+  });
+
+  const last = items[items.length - 1];
+  const nextCursor = hasMore && last ? encodeLotBalanceCursor(last.lotId, last.locationId) : null;
+  return { items, nextCursor, hasMore };
+}
+
+export async function getValuationSummary(
+  db: Database,
+  scope: LocationScope,
+  query: ValuationSummaryQuery,
+): Promise<ValuationSummary> {
+  const costBasis: ValuationCostBasis = query.costBasis ?? 'FIFO';
+  const scopeFilter = buildBalanceScopeFilter(scope);
+  if (scopeFilter.empty) {
+    return {
+      costBasis,
+      currency: 'USD',
+      skuCount: 0,
+      locationCount: 0,
+      rowCount: 0,
+      totalOnHand: toQuantity(ZERO_DECIMAL4),
+      totalValue: toMoney(ZERO_DECIMAL4),
+      totalFifoValue: toMoney(ZERO_DECIMAL4),
+      totalWacValue: toMoney(ZERO_DECIMAL4),
+      estimatedNegativeCount: 0,
+    };
+  }
+
+  const conditions: SQL[] = [];
+  if (scopeFilter.condition) {
+    conditions.push(scopeFilter.condition);
+  }
+  if (query.locationId) {
+    conditions.push(eq(stockBalances.locationId, query.locationId));
+  }
+  if (query.skuId) {
+    conditions.push(eq(stockBalances.skuId, query.skuId));
+  }
+
+  const rows = await db
+    .select()
+    .from(stockBalances)
+    .where(conditions.length > 0 ? and(...conditions) : undefined);
+
+  if (rows.length === 0) {
+    return {
+      costBasis,
+      currency: 'USD',
+      skuCount: 0,
+      locationCount: 0,
+      rowCount: 0,
+      totalOnHand: toQuantity(ZERO_DECIMAL4),
+      totalValue: toMoney(ZERO_DECIMAL4),
+      totalFifoValue: toMoney(ZERO_DECIMAL4),
+      totalWacValue: toMoney(ZERO_DECIMAL4),
+      estimatedNegativeCount: 0,
+    };
+  }
+
+  const skuIds = [...new Set(rows.map((r) => r.skuId))];
+  const locIds = [...new Set(rows.map((r) => r.locationId))];
+  const [skus, slottedMap] = await Promise.all([
+    getSkusByIds(db, skuIds),
+    fetchSlottedSumsByPair(db, skuIds, locIds),
+  ]);
+  const skuMap = new Map(skus.map((s) => [s.id, s]));
+
+  let totalOnHand = toQuantity(ZERO_DECIMAL4);
+  let totalFifoValue = toMoney(ZERO_DECIMAL4);
+  let totalWacValue = toMoney(ZERO_DECIMAL4);
+  let estimatedNegativeCount = 0;
+
+  for (const row of rows) {
+    const onHand = toQuantity(row.onHand);
+    const wac = toUnitCost(row.weightedAverageCost);
+    const rowWacVal = toMoney(mul(onHand, wac));
+
+    totalOnHand = add(totalOnHand, onHand);
+    totalWacValue = add(totalWacValue, rowWacVal);
+    if (isZeroOrNegative(onHand)) {
+      estimatedNegativeCount += 1;
+    }
+
+    const sku = skuMap.get(row.skuId);
+    if (sku?.trackLots) {
+      const slotted = slottedMap.get(`${row.skuId}:${row.locationId}`);
+      const totalSlotted = slotted?.totalSlotted ?? toQuantity(ZERO_DECIMAL4);
+      const slottedFifoValue = slotted?.slottedFifoValue ?? toMoney(ZERO_DECIMAL4);
+      const unlotted = sub(onHand, totalSlotted);
+      const rowFifoVal = toMoney(add(slottedFifoValue, toMoney(mul(unlotted, wac))));
+      totalFifoValue = add(totalFifoValue, rowFifoVal);
+    } else {
+      totalFifoValue = add(totalFifoValue, rowWacVal);
+    }
+  }
+
+  return {
+    costBasis,
+    currency: rows[0]?.currency ?? 'USD',
+    skuCount: skuIds.length,
+    locationCount: locIds.length,
+    rowCount: rows.length,
+    totalOnHand,
+    totalValue: costBasis === 'FIFO' ? totalFifoValue : totalWacValue,
+    totalFifoValue,
+    totalWacValue,
+    estimatedNegativeCount,
+  };
+}
+
 function buildBalanceScopeFilter(scope: LocationScope): { empty: boolean; condition?: SQL } {
   if ('allLocations' in scope && scope.allLocations) {
     return { empty: false };
@@ -2261,14 +2675,47 @@ interface BalanceValuationInput {
   available: Quantity;
   inTransit: Quantity;
   weightedAverageCost: UnitCost;
-  totalValue: Money;
+  wacValue: Money;
+  fifoValue?: Money | undefined;
   currency: string;
   updatedAt: Date | null;
+}
+
+async function fetchSlottedSumsByPair(
+  db: Database,
+  skuIds: string[],
+  locIds: string[],
+): Promise<Map<string, { totalSlotted: Quantity; slottedFifoValue: Money }>> {
+  if (skuIds.length === 0 || locIds.length === 0) {
+    return new Map();
+  }
+  const lotBalSums = await db
+    .select({
+      skuId: stockLots.skuId,
+      locationId: stockLotBalances.locationId,
+      totalSlotted: sql<string>`COALESCE(SUM(${stockLotBalances.onHand}), 0)`,
+      slottedFifoValue: sql<string>`COALESCE(ROUND(SUM(${stockLotBalances.onHand} * ${stockLotBalances.unitCost}), 4), 0)`,
+    })
+    .from(stockLotBalances)
+    .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
+    .where(and(inArray(stockLots.skuId, skuIds), inArray(stockLotBalances.locationId, locIds)))
+    .groupBy(stockLots.skuId, stockLotBalances.locationId);
+
+  return new Map(
+    lotBalSums.map((r) => [
+      `${r.skuId}:${r.locationId}`,
+      {
+        totalSlotted: toQuantity(r.totalSlotted),
+        slottedFifoValue: toMoney(r.slottedFifoValue),
+      },
+    ]),
+  );
 }
 
 async function buildBalanceValuationRows(
   db: Database,
   entries: BalanceValuationInput[],
+  costBasis: ValuationCostBasis = 'FIFO',
 ): Promise<StockBalance[]> {
   if (entries.length === 0) {
     return [];
@@ -2279,7 +2726,7 @@ async function buildBalanceValuationRows(
     ...new Set(entries.map((e) => e.locationId).filter((id): id is string => id !== null)),
   ];
 
-  const [skus, locRows, lotBalSums] = await Promise.all([
+  const [skus, locRows, slottedMap] = await Promise.all([
     getSkusByIds(db, skuIds),
     locIds.length > 0
       ? db
@@ -2287,25 +2734,11 @@ async function buildBalanceValuationRows(
           .from(locations)
           .where(inArray(locations.id, locIds))
       : Promise.resolve([]),
-    locIds.length > 0
-      ? db
-          .select({
-            skuId: stockLots.skuId,
-            locationId: stockLotBalances.locationId,
-            totalSlotted: sql<string>`COALESCE(SUM(${stockLotBalances.onHand}), 0)`,
-          })
-          .from(stockLotBalances)
-          .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
-          .where(and(inArray(stockLots.skuId, skuIds), inArray(stockLotBalances.locationId, locIds)))
-          .groupBy(stockLots.skuId, stockLotBalances.locationId)
-      : Promise.resolve([]),
+    fetchSlottedSumsByPair(db, skuIds, locIds),
   ]);
 
   const skuMap = new Map(skus.map((s) => [s.id, s]));
   const locMap = new Map(locRows.map((l) => [l.id, l.name]));
-  const slottedMap = new Map(
-    lotBalSums.map((r) => [`${r.skuId}:${r.locationId}`, toQuantity(r.totalSlotted)]),
-  );
 
   return entries.map((entry) => {
     const valuationStatus: ValuationStatus = isZeroOrNegative(entry.onHand)
@@ -2315,16 +2748,33 @@ async function buildBalanceValuationRows(
       isZeroOrNegative(entry.onHand) || isZeroOrNegative(entry.available);
     const sku = skuMap.get(entry.skuId);
     const sellingPrice = sku?.defaultSellingPrice ?? null;
+
+    let unlottedOnHand: Quantity | undefined;
+    let fifoValue: Money;
+
+    if (entry.fifoValue !== undefined) {
+      fifoValue = entry.fifoValue;
+    } else if (entry.locationId !== null && sku?.trackLots) {
+      const slotted = slottedMap.get(`${entry.skuId}:${entry.locationId}`);
+      const totalSlotted = slotted?.totalSlotted ?? toQuantity(ZERO_DECIMAL4);
+      const slottedFifoValue = slotted?.slottedFifoValue ?? toMoney(ZERO_DECIMAL4);
+      const diff = sub(entry.onHand, totalSlotted);
+      unlottedOnHand = isPositive(diff) ? diff : toQuantity(ZERO_DECIMAL4);
+      fifoValue = toMoney(add(slottedFifoValue, toMoney(mul(diff, entry.weightedAverageCost))));
+    } else {
+      fifoValue = entry.wacValue;
+    }
+
+    const totalValue = costBasis === 'FIFO' ? fifoValue : entry.wacValue;
+    const effectiveUnitCost =
+      costBasis === 'FIFO' && isPositive(entry.onHand)
+        ? toUnitCost(div(fifoValue, entry.onHand))
+        : entry.weightedAverageCost;
+
     const { grossMargin, grossMarginPercent } = computeMargins(
       sellingPrice,
-      entry.weightedAverageCost,
+      effectiveUnitCost,
     );
-    let unlottedOnHand: Quantity | undefined;
-    if (entry.locationId !== null && sku?.trackLots) {
-      const slotted = slottedMap.get(`${entry.skuId}:${entry.locationId}`) ?? toQuantity(ZERO_DECIMAL4);
-      const diff = sub(entry.onHand, slotted);
-      unlottedOnHand = isPositive(diff) ? diff : toQuantity(ZERO_DECIMAL4);
-    }
 
     return {
       skuId: entry.skuId,
@@ -2338,8 +2788,12 @@ async function buildBalanceValuationRows(
       available: entry.available,
       inTransit: entry.inTransit,
       ...(unlottedOnHand !== undefined ? { unlottedOnHand } : {}),
+      costBasis,
+      unitCost: effectiveUnitCost,
       weightedAverageCost: entry.weightedAverageCost,
-      totalValue: entry.totalValue,
+      totalValue,
+      fifoValue,
+      wacValue: entry.wacValue,
       sellingPrice,
       grossMargin,
       grossMarginPercent,
@@ -2361,6 +2815,7 @@ export async function listStockBalances(
     return { items: [], nextCursor: null, hasMore: false };
   }
 
+  const costBasis: ValuationCostBasis = query.costBasis ?? 'FIFO';
   const limit = query.limit ?? 50;
   const conditions: SQL[] = [];
   if (scopeFilter.condition) {
@@ -2380,6 +2835,14 @@ export async function listStockBalances(
       .where(conditions.length > 0 ? and(...conditions) : undefined)
       .orderBy(asc(stockBalances.skuId), asc(stockBalances.locationId));
 
+    const allSkuIds = [...new Set(rows.map((r) => r.skuId))];
+    const allLocIds = [...new Set(rows.map((r) => r.locationId))];
+    const [skus, slottedMap] = await Promise.all([
+      getSkusByIds(db, allSkuIds),
+      fetchSlottedSumsByPair(db, allSkuIds, allLocIds),
+    ]);
+    const skuMap = new Map(skus.map((s) => [s.id, s]));
+
     const bySku = new Map<string, StockBalanceRow[]>();
     for (const row of rows) {
       const list = bySku.get(row.skuId) ?? [];
@@ -2396,20 +2859,35 @@ export async function listStockBalances(
     const aggregatedEntries: BalanceValuationInput[] = [];
     for (const skuId of skuIds) {
       const group = bySku.get(skuId)!;
+      const sku = skuMap.get(skuId);
       let onHand = toQuantity('0');
       let reserved = toQuantity('0');
       let inTransit = toQuantity('0');
-      let totalValue = toMoney('0');
+      let wacValue = toMoney('0');
+      let fifoValue = toMoney('0');
       let latestUpdatedAt: Date | null = null;
       let fallbackWac = toUnitCost('0');
 
       for (const r of group) {
         const rowOnHand = toQuantity(r.onHand);
         const rowWac = toUnitCost(r.weightedAverageCost);
+        const rowWacVal = toMoney(mul(rowOnHand, rowWac));
         onHand = add(onHand, rowOnHand);
         reserved = add(reserved, toQuantity(r.reserved));
         inTransit = add(inTransit, toQuantity(r.inTransit));
-        totalValue = add(totalValue, toMoney(mul(rowOnHand, rowWac)));
+        wacValue = add(wacValue, rowWacVal);
+
+        if (sku?.trackLots) {
+          const slotted = slottedMap.get(`${r.skuId}:${r.locationId}`);
+          const totalSlotted = slotted?.totalSlotted ?? toQuantity(ZERO_DECIMAL4);
+          const slottedFifoValue = slotted?.slottedFifoValue ?? toMoney(ZERO_DECIMAL4);
+          const unlotted = sub(rowOnHand, totalSlotted);
+          const rowFifoVal = toMoney(add(slottedFifoValue, toMoney(mul(unlotted, rowWac))));
+          fifoValue = add(fifoValue, rowFifoVal);
+        } else {
+          fifoValue = add(fifoValue, rowWacVal);
+        }
+
         if (!latestUpdatedAt || r.updatedAt > latestUpdatedAt) {
           latestUpdatedAt = r.updatedAt;
           if (isPositive(rowWac)) {
@@ -2426,10 +2904,13 @@ export async function listStockBalances(
 
       let weightedAverageCost: UnitCost;
       if (isPositive(onHand)) {
-        weightedAverageCost = toUnitCost(div(totalValue, onHand));
+        weightedAverageCost = toUnitCost(div(wacValue, onHand));
       } else {
         weightedAverageCost = fallbackWac;
-        totalValue = toMoney(mul(onHand, weightedAverageCost));
+        wacValue = toMoney(mul(onHand, weightedAverageCost));
+        if (!sku?.trackLots) {
+          fifoValue = wacValue;
+        }
       }
 
       aggregatedEntries.push({
@@ -2440,7 +2921,8 @@ export async function listStockBalances(
         available,
         inTransit,
         weightedAverageCost,
-        totalValue,
+        wacValue,
+        fifoValue,
         currency: group[0]?.currency ?? 'USD',
         updatedAt: latestUpdatedAt,
       });
@@ -2448,7 +2930,7 @@ export async function listStockBalances(
 
     const hasMore = aggregatedEntries.length > limit;
     const pageEntries = hasMore ? aggregatedEntries.slice(0, limit) : aggregatedEntries;
-    const items = await buildBalanceValuationRows(db, pageEntries);
+    const items = await buildBalanceValuationRows(db, pageEntries, costBasis);
     const last = items[items.length - 1];
     const nextCursor = hasMore && last ? encodeBalanceCursor(last.skuId, null) : null;
     return { items, nextCursor, hasMore };
@@ -2500,11 +2982,12 @@ export async function listStockBalances(
         available: toQuantity(row.available),
         inTransit: toQuantity(row.inTransit),
         weightedAverageCost,
-        totalValue: toMoney(mul(onHand, weightedAverageCost)),
+        wacValue: toMoney(mul(onHand, weightedAverageCost)),
         currency: row.currency,
         updatedAt: row.updatedAt,
       };
     }),
+    costBasis,
   );
 
   const last = items[items.length - 1];
