@@ -526,7 +526,7 @@ describe('catalog module integration', () => {
     expect(delUnused.statusCode).toBe(200);
   });
 
-  it('supports opt-in trackLots and trackExpiry flags, enforces trackExpiry => trackLots, and blocks enabling trackLots with positive stock', async () => {
+  it('supports opt-in trackLots and trackExpiry flags, enforces trackExpiry => trackLots, and allows enabling trackLots with positive stock (hybrid cutover)', async () => {
     const { app, cookie } = await setupAuthedApp();
 
     const uomRes = await app.inject({
@@ -602,33 +602,25 @@ describe('catalog module integration', () => {
     expect(invalidPatch.statusCode).toBe(422);
     expect(invalidPatch.json().error.code).toBe(ERROR_CODES.INVALID_LOT_CONFIGURATION);
 
-    // 5. Turning trackLots=true on a SKU with positive on-hand stock is rejected (422)
+    // 5. Turning trackLots=true on a SKU with positive on-hand stock succeeds (hybrid cutover)
     const unregisterPositive = registerSkuPositiveStockChecker(
       async (_db, id) => id === defaultSku.id,
     );
     try {
-      const blockedEnable = await app.inject({
+      const enabledWithStock = await app.inject({
         method: 'PATCH',
         url: `/api/v1/skus/${defaultSku.id}`,
         headers: { cookie, 'idempotency-key': uuidv7() },
-        payload: { trackLots: true },
+        payload: { trackLots: true, trackExpiry: true },
       });
-      expect(blockedEnable.statusCode).toBe(422);
-      expect(blockedEnable.json().error.code).toBe(ERROR_CODES.SKU_HAS_POSITIVE_STOCK);
+      expect(enabledWithStock.statusCode).toBe(200);
+      expect(enabledWithStock.json().data.trackLots).toBe(true);
+      expect(enabledWithStock.json().data.trackExpiry).toBe(true);
     } finally {
       unregisterPositive();
     }
 
-    // 6. With zero stock, enabling trackLots=true succeeds and lookup returns the flags
-    const allowedEnable = await app.inject({
-      method: 'PATCH',
-      url: `/api/v1/skus/${defaultSku.id}`,
-      headers: { cookie, 'idempotency-key': uuidv7() },
-      payload: { trackLots: true, trackExpiry: true },
-    });
-    expect(allowedEnable.statusCode).toBe(200);
-    expect(allowedEnable.json().data.trackLots).toBe(true);
-    expect(allowedEnable.json().data.trackExpiry).toBe(true);
+    // 6. Lookup returns the updated flags
 
     const lookupRes = await app.inject({
       method: 'GET',

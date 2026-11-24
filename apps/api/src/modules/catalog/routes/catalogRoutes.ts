@@ -36,7 +36,6 @@ import {
   assertProductExists,
   assertUnitOfMeasureExists,
   findSkuByIdOrCode,
-  hasPositiveOnHandStock,
   hasProductReferences,
   hasSkuReferences,
   hasUnitOfMeasureReferences,
@@ -857,15 +856,6 @@ export function registerCatalogRoutes(
             ERROR_CODES.INVALID_LOT_CONFIGURATION,
             'trackExpiry cannot be enabled when trackLots is false',
           );
-        }
-        if (!existing.trackLots && nextTrackLots) {
-          const positiveStock = await hasPositiveOnHandStock(ctx.tx, id);
-          if (positiveStock) {
-            throw new ValidationError(
-              ERROR_CODES.SKU_HAS_POSITIVE_STOCK,
-              'Cannot enable lot tracking on a SKU with positive On-Hand Stock',
-            );
-          }
         }
 
         if (productId !== undefined) {

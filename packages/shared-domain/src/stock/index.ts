@@ -280,6 +280,7 @@ export interface StockBalance {
   reserved: Quantity;
   available: Quantity;
   inTransit: Quantity;
+  unlottedOnHand?: Quantity | undefined;
   weightedAverageCost?: UnitCost | undefined;
   totalValue?: Money | undefined;
   sellingPrice: Money | null;
@@ -301,6 +302,7 @@ export const StockBalanceSchema: z.ZodType<StockBalance, z.ZodTypeDef, unknown> 
   reserved: zQuantity,
   available: zQuantity,
   inTransit: zQuantity,
+  unlottedOnHand: zQuantity.optional(),
   weightedAverageCost: zUnitCost.optional(),
   totalValue: zMoney.optional(),
   sellingPrice: zMoney.nullable(),
@@ -360,4 +362,90 @@ export const FefoPreviewQuerySchema: z.ZodType<
     message: 'Preview quantity must be greater than zero',
   }),
   today: zIsoDate.optional(),
+});
+
+export const RecentReceiptCostsQuerySchema = z.object({
+  locationId: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(20).default(5),
+});
+export type RecentReceiptCostsQuery = z.infer<typeof RecentReceiptCostsQuerySchema>;
+
+export interface RecentReceiptCostItem {
+  movementId: string;
+  referenceId: string | null;
+  locationId: string;
+  quantity: Quantity;
+  recentUnitCost?: UnitCost | undefined;
+  currency: string;
+  createdAt: string;
+}
+
+export interface RecentReceiptCostsResult {
+  skuId: string;
+  locationId: string | null;
+  suggestedUnitCost?: UnitCost | null | undefined;
+  currency: string;
+  recentReceipts: RecentReceiptCostItem[];
+}
+
+export interface AssignOpeningLotLineInput {
+  lotCode: string;
+  mfgDate?: string | null | undefined;
+  expDate?: string | null | undefined;
+  quantity: Quantity;
+  unitCost?: UnitCost | undefined;
+}
+
+export interface AssignOpeningLotLineRawInput {
+  lotCode: string;
+  mfgDate?: string | null | undefined;
+  expDate?: string | null | undefined;
+  quantity: string;
+  unitCost?: string | undefined;
+}
+
+export const AssignOpeningLotLineInputSchema: z.ZodType<
+  AssignOpeningLotLineInput,
+  z.ZodTypeDef,
+  AssignOpeningLotLineRawInput
+> = z.object({
+  lotCode: z.string().trim().min(1).max(100),
+  mfgDate: zIsoDate.nullable().optional(),
+  expDate: zIsoDate.nullable().optional(),
+  quantity: zQuantity.refine((val) => !isZero(val) && !isNegative(val), {
+    message: 'Opening lot quantity must be greater than zero',
+  }),
+  unitCost: zUnitCost
+    .refine((val) => !isNegative(val), {
+      message: 'Unit cost cannot be negative',
+    })
+    .optional(),
+});
+
+export interface AssignOpeningLotsInput {
+  skuId: string;
+  locationId: string;
+  currency?: string | undefined;
+  note?: string | null | undefined;
+  lots: AssignOpeningLotLineInput[];
+}
+
+export interface AssignOpeningLotsRawInput {
+  skuId: string;
+  locationId: string;
+  currency?: string | undefined;
+  note?: string | null | undefined;
+  lots: AssignOpeningLotLineRawInput[];
+}
+
+export const AssignOpeningLotsInputSchema: z.ZodType<
+  AssignOpeningLotsInput,
+  z.ZodTypeDef,
+  AssignOpeningLotsRawInput
+> = z.object({
+  skuId: z.string().uuid(),
+  locationId: z.string().uuid(),
+  currency: z.string().trim().length(3).toUpperCase().default('USD'),
+  note: z.string().trim().max(1000).nullable().optional(),
+  lots: z.array(AssignOpeningLotLineInputSchema).min(1).max(100),
 });

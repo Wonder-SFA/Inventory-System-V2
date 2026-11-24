@@ -1,17 +1,22 @@
 import type { Database } from '@iv2/db';
 import {
+  AssignOpeningLotsInputSchema,
   CreateStockAdjustmentInputSchema,
   CreateStockIssueInputSchema,
   FefoPreviewQuerySchema,
   ListStockBalancesQuerySchema,
   ListStockLotBalancesQuerySchema,
   ListStockMovementsQuerySchema,
+  RecentReceiptCostsQuerySchema,
   uuidv7,
 } from '@iv2/shared-domain';
 import type { FastifyInstance } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
+import { z } from 'zod';
 import { type OutboxDispatcher, executeCommand } from '../../../shared/index.js';
 import {
+  assignOpeningLots,
+  getRecentReceiptCosts,
   listStockBalances,
   listStockLotBalances,
   listStockMovements,
@@ -120,6 +125,34 @@ export function registerStockRoutes(
       );
       return {
         data: policy.redactCosts(preview),
+        meta: {
+          requestId: request.id,
+        },
+      };
+    },
+  );
+
+  typedApp.get(
+    '/api/v1/skus/:id/recent-receipt-costs',
+    {
+      schema: {
+        params: z.object({ id: z.string().uuid() }),
+        querystring: RecentReceiptCostsQuerySchema,
+      },
+    },
+    async (request) => {
+      const policy = request.accessPolicy!;
+      if (request.query.locationId) {
+        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
+      }
+      const result = await getRecentReceiptCosts(
+        db,
+        policy.locationScope,
+        request.params.id,
+        request.query,
+      );
+      return {
+        data: policy.redactCosts(result),
         meta: {
           requestId: request.id,
         },
@@ -261,6 +294,70 @@ export function registerStockRoutes(
             return {
               data: recorded.movements.map((m) => policy.redactCosts(m)),
               warnings: recorded.warnings,
+              statusCode: 201,
+            };
+          },
+        },
+        {
+          db,
+          outboxDispatcher,
+          requestId: request.id,
+          getAccessSwitch: () => request.accessSwitch ?? 'ACTIVE',
+        },
+      );
+
+      return reply.status(result.statusCode).send(result.body);
+    },
+  );
+
+  typedApp.post(
+    '/api/v1/stock-lots/assign-opening',
+    {
+      schema: {
+        body: AssignOpeningLotsInputSchema,
+      },
+    },
+    async (request, reply) => {
+      const policy = request.accessPolicy!;
+      const result = await executeCommand(
+        {
+          actorId: policy.actor.id,
+          method: request.method,
+          path: request.url,
+          payload: request.body,
+          idempotencyKey: request.headers['idempotency-key'] as string | undefined,
+          accessPolicy: policy,
+          permission: {
+            action: 'adjust',
+            resource: 'stock_movement',
+            context: {
+              locationId: request.body.locationId,
+            },
+          },
+          handler: async (ctx) => {
+            const movementIdempotencyKey = ctx.idempotencyKey ?? uuidv7();
+            const assigned = await assignOpeningLots(
+              ctx.tx,
+              {
+                skuId: request.body.skuId,
+                locationId: request.body.locationId,
+                lots: request.body.lots,
+                currency: request.body.currency,
+                note: request.body.note,
+                actorId: policy.actor.id,
+                idempotencyKey: movementIdempotencyKey,
+              },
+              {
+                emit: ctx.emit,
+              },
+            );
+
+            return {
+              data: {
+                assignedQuantity: assigned.assignedQuantity,
+                remainingUnlottedQuantity: assigned.remainingUnlottedQuantity,
+                movements: assigned.movements.map((m) => policy.redactCosts(m)),
+              },
               statusCode: 201,
             };
           },
