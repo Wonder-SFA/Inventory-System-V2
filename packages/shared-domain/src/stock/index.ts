@@ -4,6 +4,7 @@ import {
   type Quantity,
   type UnitCost,
   isNegative,
+  isPositive,
   isZero,
   zMoney,
   zQuantity,
@@ -120,6 +121,9 @@ export interface StockMovement {
   referenceId: string | null;
   actorId: string;
   idempotencyKey: string;
+  eodReconciliationRequired?: boolean | undefined;
+  expiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
   createdAt: string;
 }
 
@@ -145,12 +149,76 @@ export const StockMovementSchema: z.ZodType<StockMovement, z.ZodTypeDef, unknown
   referenceId: z.string().uuid().nullable(),
   actorId: z.string(),
   idempotencyKey: z.string().uuid(),
+  eodReconciliationRequired: z.boolean().optional(),
+  expiredLotOverride: z.boolean().optional(),
+  overrideReason: z.string().nullable().optional(),
   createdAt: z.string(),
+});
+
+export interface LotAllocationInput {
+  lotId: string;
+  quantity: Quantity;
+}
+
+export interface LotAllocationRawInput {
+  lotId: string;
+  quantity: string;
+}
+
+export const LotAllocationInputSchema: z.ZodType<
+  LotAllocationInput,
+  z.ZodTypeDef,
+  LotAllocationRawInput
+> = z.object({
+  lotId: z.string().uuid(),
+  quantity: zQuantity.refine((val) => isPositive(val), {
+    message: 'Lot allocation quantity must be greater than zero',
+  }),
+});
+
+export interface CreateStockIssueInput {
+  skuId: string;
+  locationId: string;
+  quantity: Quantity;
+  currency: string;
+  note?: string | null | undefined;
+  lotAllocations?: LotAllocationInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
+}
+
+export interface CreateStockIssueRawInput {
+  skuId: string;
+  locationId: string;
+  quantity: string;
+  currency?: string | undefined;
+  note?: string | null | undefined;
+  lotAllocations?: LotAllocationRawInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
+}
+
+export const CreateStockIssueInputSchema: z.ZodType<
+  CreateStockIssueInput,
+  z.ZodTypeDef,
+  CreateStockIssueRawInput
+> = z.object({
+  skuId: z.string().uuid(),
+  locationId: z.string().uuid(),
+  quantity: zQuantity.refine((val) => isPositive(val), {
+    message: 'Issue quantity must be greater than zero',
+  }),
+  currency: z.string().trim().length(3).toUpperCase().default('USD'),
+  note: z.string().trim().max(1000).nullable().optional(),
+  lotAllocations: z.array(LotAllocationInputSchema).max(200).optional(),
+  confirmExpiredLotOverride: z.boolean().optional(),
+  overrideReason: z.string().trim().max(500).nullable().optional(),
 });
 
 export interface CreateStockAdjustmentInput {
   skuId: string;
   locationId: string;
+  lotId?: string | undefined;
   quantityDelta: Quantity;
   reasonCategory: AdjustmentReasonCategory;
   unitCost?: UnitCost | undefined;
@@ -161,6 +229,7 @@ export interface CreateStockAdjustmentInput {
 export interface CreateStockAdjustmentRawInput {
   skuId: string;
   locationId: string;
+  lotId?: string | undefined;
   quantityDelta: string;
   reasonCategory: AdjustmentReasonCategory;
   unitCost?: string | undefined;
@@ -175,6 +244,7 @@ export const CreateStockAdjustmentInputSchema: z.ZodType<
 > = z.object({
   skuId: z.string().uuid(),
   locationId: z.string().uuid(),
+  lotId: z.string().uuid().optional(),
   quantityDelta: zQuantity.refine((val) => !isZero(val), {
     message: 'Quantity delta must be non-zero',
   }),
@@ -187,6 +257,12 @@ export const CreateStockAdjustmentInputSchema: z.ZodType<
   currency: z.string().trim().length(3).toUpperCase().default('USD'),
   note: z.string().trim().max(1000).nullable().optional(),
 });
+
+export const ListStockLotBalancesQuerySchema = z.object({
+  skuId: z.string().uuid(),
+  locationId: z.string().uuid(),
+});
+export type ListStockLotBalancesQuery = z.infer<typeof ListStockLotBalancesQuerySchema>;
 
 export const ValuationStatusSchema = z.enum(['NORMAL', 'ESTIMATED_NEGATIVE_STOCK']);
 export type ValuationStatus = z.infer<typeof ValuationStatusSchema>;
