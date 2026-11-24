@@ -561,6 +561,15 @@ export async function receivePurchaseOrder(
       type: 'RECEIPT',
       skuId: line.skuId,
       locationId: po.locationId,
+      ...(reqLine.lotCode !== undefined
+        ? {
+            lotInput: {
+              lotCode: reqLine.lotCode,
+              mfgDate: reqLine.mfgDate,
+              expDate: reqLine.expDate,
+            },
+          }
+        : {}),
       quantityDelta: reqLine.quantity,
       unitCost: reqLine.unitCost ?? toUnitCost(line.unitCost),
       currency: reqLine.currency ?? line.currency,

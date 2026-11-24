@@ -56,6 +56,8 @@ export default function CatalogPage() {
   const [skuCode, setSkuCode] = useState('');
   const [skuName, setSkuName] = useState('');
   const [skuPrice, setSkuPrice] = useState('');
+  const [skuTrackLots, setSkuTrackLots] = useState(false);
+  const [skuTrackExpiry, setSkuTrackExpiry] = useState(false);
 
   const productMap = useMemo(() => {
     const map = new Map<string, Product>();
@@ -276,6 +278,8 @@ export default function CatalogPage() {
     setSkuCode(sku.code);
     setSkuName(sku.name);
     setSkuPrice(sku.defaultSellingPrice ?? '');
+    setSkuTrackLots(sku.trackLots);
+    setSkuTrackExpiry(sku.trackExpiry);
   }
 
   function resetSkuForm() {
@@ -285,6 +289,8 @@ export default function CatalogPage() {
     setSkuCode('');
     setSkuName('');
     setSkuPrice('');
+    setSkuTrackLots(false);
+    setSkuTrackExpiry(false);
   }
 
   async function handleSaveSku(e: FormEvent) {
@@ -298,6 +304,8 @@ export default function CatalogPage() {
         code: skuCode,
         name: skuName,
         defaultSellingPrice: skuPrice.trim() === '' ? null : skuPrice.trim(),
+        trackLots: skuTrackLots,
+        trackExpiry: skuTrackLots ? skuTrackExpiry : false,
       };
       if (editingSkuId) {
         await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
@@ -765,6 +773,37 @@ export default function CatalogPage() {
                   placeholder="0.0000"
                 />
               </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                <input
+                  type="checkbox"
+                  checked={skuTrackLots}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setSkuTrackLots(checked);
+                    if (!checked) {
+                      setSkuTrackExpiry(false);
+                    }
+                  }}
+                />
+                Track Lots
+              </label>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontSize: 13,
+                  opacity: skuTrackLots ? 1 : 0.5,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={skuTrackExpiry}
+                  disabled={!skuTrackLots}
+                  onChange={(e) => setSkuTrackExpiry(e.target.checked)}
+                />
+                Track Expiry
+              </label>
               <button type="submit" className="btn btn-primary" disabled={busy}>
                 {editingSkuId ? 'Save SKU' : 'Add SKU'}
               </button>
@@ -821,6 +860,7 @@ export default function CatalogPage() {
                   <th>Product</th>
                   <th>Unit</th>
                   <th>Default Price</th>
+                  <th>Lot Tracking</th>
                   <th>Status</th>
                   <th style={{ width: 240 }}>Actions</th>
                 </tr>
@@ -835,6 +875,9 @@ export default function CatalogPage() {
                     <td>{productMap.get(s.productId)?.name ?? s.productId}</td>
                     <td>{unitMap.get(s.unitOfMeasureId)?.code ?? s.unitOfMeasureId}</td>
                     <td>{s.defaultSellingPrice ?? '—'}</td>
+                    <td>
+                      {s.trackLots ? (s.trackExpiry ? 'Lots + Expiry' : 'Lots Only') : '—'}
+                    </td>
                     <td>
                       <span
                         className={`badge ${

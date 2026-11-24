@@ -6,6 +6,7 @@ import {
   ERROR_CODES,
   type ListStockBalancesQuery,
   type ListStockMovementsQuery,
+  type LotInput,
   type Money,
   NotFoundError,
   type Quantity,
@@ -15,8 +16,10 @@ import {
   type UUID,
   type UnitCost,
   type ValuationStatus,
+  ValidationError,
   ZERO_DECIMAL4,
   add,
+  calculateBlendedLotCost,
   calculateWeightedAverageCost,
   div,
   formatDecimal4,
@@ -41,13 +44,20 @@ import {
   outboxEvents,
   paginateKeysetResult,
 } from '../../../shared/index.js';
-import { findSkuByIdOrCode, getSkusByIds, registerSkuReferenceChecker } from '../../catalog/public/index.js';
+import {
+  findSkuByIdOrCode,
+  getSkusByIds,
+  registerSkuPositiveStockChecker,
+  registerSkuReferenceChecker,
+} from '../../catalog/public/index.js';
 import type { LocationScope } from '../../iam/public/index.js';
 import {
   type StockBalanceRow,
   type StockMovementRow,
   locations,
   stockBalances,
+  stockLotBalances,
+  stockLots,
   stockMovements,
 } from '../db/index.js';
 import { registerLocationReferenceChecker } from './locations.js';
@@ -76,6 +86,9 @@ export interface PostMovementLine {
   type: StockMovementType;
   skuId: UUID;
   locationId: UUID;
+  lotInput?: LotInput | undefined;
+  sliceIndex?: number | undefined;
+  movementGroupId?: UUID | null | undefined;
   quantityDelta: Quantity;
   unitCost?: UnitCost | null | undefined;
   currency?: string | undefined;
@@ -285,6 +298,7 @@ function toStockMovementDto(
   row: StockMovementRow,
   skuInfo?: { code: string; name: string },
   locationName?: string,
+  lotCode?: string | null,
 ): StockMovement {
   return {
     id: row.id,
@@ -293,8 +307,13 @@ function toStockMovementDto(
     ...(skuInfo ? { skuCode: skuInfo.code, skuName: skuInfo.name } : {}),
     locationId: row.locationId,
     ...(locationName !== undefined ? { locationName } : {}),
+    lotId: row.lotId ?? null,
+    ...(lotCode !== undefined ? { lotCode } : {}),
+    sliceIndex: row.sliceIndex,
+    movementGroupId: row.movementGroupId ?? null,
     quantityDelta: toQuantity(row.quantityDelta),
     unitCost: row.unitCost !== null ? toUnitCost(row.unitCost) : null,
+    wacUnitCost: row.wacUnitCost !== null ? toUnitCost(row.wacUnitCost) : null,
     currency: row.currency,
     reasonCategory: row.reasonCategory ?? null,
     note: row.note ?? null,
@@ -422,6 +441,93 @@ function eventTypeForMovement(type: StockMovementType): string {
   }
 }
 
+async function upsertAndUpdateStockLot(
+  tx: DbTransaction,
+  params: {
+    skuId: string;
+    locationId: string;
+    lotInput: LotInput;
+    quantityDelta: Quantity;
+    incomingUnitCost: UnitCost | null;
+    currency: string;
+    blendCost: boolean;
+  },
+): Promise<{ lotId: string; lotCode: string }> {
+  const normalizedCode = params.lotInput.lotCode.trim();
+  const [existingLot] = await tx
+    .select()
+    .from(stockLots)
+    .where(and(eq(stockLots.skuId, params.skuId), sql`LOWER(${stockLots.lotCode}) = LOWER(${normalizedCode})`))
+    .for('update')
+    .limit(1);
+
+  let lotId: string;
+  let lotCode: string;
+
+  if (existingLot) {
+    if (
+      params.lotInput.expDate !== undefined &&
+      existingLot.expDate !== params.lotInput.expDate
+    ) {
+      throw new ValidationError(
+        ERROR_CODES.LOT_EXPIRY_MISMATCH,
+        `Lot "${existingLot.lotCode}" already exists with expiry date ${existingLot.expDate ?? 'none'}, cannot receive with ${params.lotInput.expDate ?? 'none'}`,
+      );
+    }
+    lotId = existingLot.id;
+    lotCode = existingLot.lotCode;
+  } else {
+    lotId = uuidv7();
+    lotCode = normalizedCode;
+    await tx.insert(stockLots).values({
+      id: lotId,
+      skuId: params.skuId,
+      lotCode,
+      mfgDate: params.lotInput.mfgDate ?? null,
+      expDate: params.lotInput.expDate ?? null,
+    });
+  }
+
+  await tx
+    .insert(stockLotBalances)
+    .values({
+      lotId,
+      locationId: params.locationId,
+      onHand: ZERO_DECIMAL4,
+      inTransit: ZERO_DECIMAL4,
+      unitCost: params.incomingUnitCost ?? ZERO_DECIMAL4,
+      currency: params.currency,
+    })
+    .onConflictDoNothing();
+
+  const [lotBal] = await tx
+    .select()
+    .from(stockLotBalances)
+    .where(and(eq(stockLotBalances.lotId, lotId), eq(stockLotBalances.locationId, params.locationId)))
+    .for('update')
+    .limit(1);
+
+  const currentOnHand = toQuantity(lotBal!.onHand);
+  const currentUnitCost = toUnitCost(lotBal!.unitCost);
+  const nextOnHand = add(currentOnHand, params.quantityDelta);
+  const nextUnitCost =
+    params.blendCost && params.incomingUnitCost !== null
+      ? calculateBlendedLotCost(currentOnHand, currentUnitCost, params.quantityDelta, params.incomingUnitCost)
+      : currentUnitCost;
+
+  await tx
+    .update(stockLotBalances)
+    .set({
+      onHand: nextOnHand,
+      unitCost: nextUnitCost,
+      currency: params.currency,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(stockLotBalances.lotId, lotId), eq(stockLotBalances.locationId, params.locationId)));
+
+  return { lotId, lotCode };
+}
+
 export async function postMovements(
   tx: DbTransaction,
   lines: readonly PostMovementLine[],
@@ -443,6 +549,10 @@ export async function postMovements(
     }
   }
 
+  const uniqueSkuIds = [...new Set(lines.map((l) => l.skuId))];
+  const skus = await getSkusByIds(tx, uniqueSkuIds);
+  const skuMap = new Map(skus.map((s) => [s.id, s]));
+
   const map = await upsertAndLockBalances(
     tx,
     lines.map((l) => ({ skuId: l.skuId, locationId: l.locationId })),
@@ -458,20 +568,53 @@ export async function postMovements(
     const oldWac = state.weightedAverageCost;
     const newQty = add(oldQty, line.quantityDelta);
 
-    let recordedUnitCost: UnitCost | null = line.unitCost ?? null;
+    const sku = skuMap.get(line.skuId);
+    if (line.type === 'RECEIPT' && sku?.trackLots) {
+      if (!line.lotInput?.lotCode?.trim()) {
+        throw new ValidationError(
+          ERROR_CODES.LOT_CODE_REQUIRED,
+          `Lot code is required when receiving lot-tracked SKU ${sku.code}`,
+        );
+      }
+      if (sku.trackExpiry && !line.lotInput.expDate) {
+        throw new ValidationError(
+          ERROR_CODES.EXPIRY_DATE_REQUIRED,
+          `Expiry date is required when receiving expiry-tracked SKU ${sku.code}`,
+        );
+      }
+    }
 
-    if (
-      (line.type === 'RECEIPT' ||
-        line.type === 'TRANSFER_IN' ||
-        (line.type === 'ADJUSTMENT' && isPositive(line.quantityDelta))) &&
-      line.unitCost !== undefined &&
-      line.unitCost !== null
-    ) {
+    let recordedUnitCost: UnitCost | null = line.unitCost ?? null;
+    const isPositiveInbound =
+      line.type === 'RECEIPT' ||
+      line.type === 'TRANSFER_IN' ||
+      (line.type === 'ADJUSTMENT' && isPositive(line.quantityDelta));
+
+    if (isPositiveInbound && line.unitCost !== undefined && line.unitCost !== null) {
       const wacResult = calculateWeightedAverageCost(oldQty, oldWac, line.quantityDelta, line.unitCost);
       state.weightedAverageCost = wacResult.weightedAverageCost;
       recordedUnitCost = line.unitCost;
     } else if (line.type === 'ISSUE' || line.type === 'TRANSFER_OUT') {
       recordedUnitCost = line.unitCost ?? oldWac;
+    }
+
+    const recordedWacUnitCost: UnitCost = state.weightedAverageCost;
+    const effectiveCurrency = line.currency ?? state.currency ?? 'USD';
+
+    let lotId: string | null = null;
+    let lotCode: string | undefined;
+    if (line.lotInput?.lotCode?.trim()) {
+      const lotResult = await upsertAndUpdateStockLot(tx, {
+        skuId: line.skuId,
+        locationId: line.locationId,
+        lotInput: line.lotInput,
+        quantityDelta: line.quantityDelta,
+        incomingUnitCost: recordedUnitCost,
+        currency: effectiveCurrency,
+        blendCost: isPositiveInbound,
+      });
+      lotId = lotResult.lotId;
+      lotCode = lotResult.lotCode;
     }
 
     state.onHand = newQty;
@@ -489,9 +632,13 @@ export async function postMovements(
         type: line.type,
         skuId: line.skuId,
         locationId: line.locationId,
+        lotId,
+        sliceIndex: line.sliceIndex ?? 0,
+        movementGroupId: line.movementGroupId ?? null,
         quantityDelta: line.quantityDelta,
         unitCost: recordedUnitCost,
-        currency: line.currency ?? state.currency ?? 'USD',
+        wacUnitCost: recordedWacUnitCost,
+        currency: effectiveCurrency,
         reasonCategory: line.reasonCategory ?? null,
         note: line.note ?? null,
         referenceType: line.referenceType ?? null,
@@ -501,7 +648,7 @@ export async function postMovements(
       })
       .returning();
 
-    const dto = toStockMovementDto(row!);
+    const dto = toStockMovementDto(row!, undefined, undefined, lotCode);
     insertedMovements.push(dto);
     warnings.push(...collectStockWarnings(state));
 
@@ -579,6 +726,7 @@ export async function dispatchTransfer(
         locationId: line.sourceLocationId,
         quantityDelta: negate(line.quantity),
         unitCost: dispatchUnitCost,
+        wacUnitCost: dispatchUnitCost,
         currency,
         reasonCategory: null,
         note: line.note ?? null,
@@ -671,6 +819,7 @@ export async function receiveTransfer(
         locationId: line.destinationLocationId,
         quantityDelta: line.quantity,
         unitCost: line.dispatchUnitCost,
+        wacUnitCost: state.weightedAverageCost,
         currency: line.currency ?? state.currency ?? 'USD',
         reasonCategory: null,
         note: line.note ?? null,
@@ -1174,8 +1323,9 @@ export async function listStockMovements(
   const page = paginateKeysetResult(rows, limit);
   const skuIds = [...new Set(page.items.map((r) => r.skuId))];
   const locIds = [...new Set(page.items.map((r) => r.locationId))];
+  const lotIds = [...new Set(page.items.map((r) => r.lotId).filter((id): id is string => id !== null))];
 
-  const [skus, locRows] = await Promise.all([
+  const [skus, locRows, lotRows] = await Promise.all([
     getSkusByIds(db, skuIds),
     locIds.length > 0
       ? db
@@ -1183,13 +1333,27 @@ export async function listStockMovements(
           .from(locations)
           .where(inArray(locations.id, locIds))
       : Promise.resolve([]),
+    lotIds.length > 0
+      ? db
+          .select({ id: stockLots.id, lotCode: stockLots.lotCode })
+          .from(stockLots)
+          .where(inArray(stockLots.id, lotIds))
+      : Promise.resolve([]),
   ]);
 
   const skuMap = new Map(skus.map((s) => [s.id, { code: s.code, name: s.name }]));
   const locMap = new Map(locRows.map((l) => [l.id, l.name]));
+  const lotMap = new Map(lotRows.map((l) => [l.id, l.lotCode]));
 
   return {
-    items: page.items.map((r) => toStockMovementDto(r, skuMap.get(r.skuId), locMap.get(r.locationId))),
+    items: page.items.map((r) =>
+      toStockMovementDto(
+        r,
+        skuMap.get(r.skuId),
+        locMap.get(r.locationId),
+        r.lotId ? (lotMap.get(r.lotId) ?? null) : null,
+      ),
+    ),
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,
   };
@@ -1235,11 +1399,24 @@ async function hasInventoryLocationReferences(
   return Boolean(bal);
 }
 
+async function hasInventoryPositiveOnHandStock(
+  db: Database | DbTransaction,
+  skuId: string,
+): Promise<boolean> {
+  const [bal] = await db
+    .select({ skuId: stockBalances.skuId })
+    .from(stockBalances)
+    .where(and(eq(stockBalances.skuId, skuId), sql`${stockBalances.onHand} > 0`))
+    .limit(1);
+  return Boolean(bal);
+}
+
 export function registerInventoryReferenceCheckers(): void {
   if (referenceCheckersRegistered) {
     return;
   }
   registerSkuReferenceChecker(hasInventorySkuReferences);
+  registerSkuPositiveStockChecker(hasInventoryPositiveOnHandStock);
   registerLocationReferenceChecker(hasInventoryLocationReferences);
   referenceCheckersRegistered = true;
 }

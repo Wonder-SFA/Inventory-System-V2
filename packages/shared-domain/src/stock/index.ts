@@ -29,6 +29,74 @@ export const AdjustmentReasonCategorySchema = z.enum([
 ]);
 export type AdjustmentReasonCategory = z.infer<typeof AdjustmentReasonCategorySchema>;
 
+export const zIsoDate = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be in YYYY-MM-DD format')
+  .refine((val) => {
+    const d = new Date(`${val}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(val);
+  }, 'Invalid calendar date');
+
+export interface LotInput {
+  lotCode: string;
+  mfgDate?: string | null | undefined;
+  expDate?: string | null | undefined;
+}
+
+export const LotInputSchema: z.ZodType<LotInput, z.ZodTypeDef, LotInput> = z.object({
+  lotCode: z.string().trim().min(1, 'Lot code is required').max(100),
+  mfgDate: zIsoDate.nullable().optional(),
+  expDate: zIsoDate.nullable().optional(),
+});
+
+export interface StockLot {
+  id: string;
+  skuId: string;
+  lotCode: string;
+  mfgDate: string | null;
+  expDate: string | null;
+  createdAt: string;
+}
+
+export const StockLotSchema: z.ZodType<StockLot, z.ZodTypeDef, unknown> = z.object({
+  id: z.string().uuid(),
+  skuId: z.string().uuid(),
+  lotCode: z.string().min(1),
+  mfgDate: zIsoDate.nullable(),
+  expDate: zIsoDate.nullable(),
+  createdAt: z.string(),
+});
+
+export interface StockLotBalance {
+  lotId: string;
+  skuId: string;
+  lotCode: string;
+  mfgDate: string | null;
+  expDate: string | null;
+  locationId: string;
+  locationName?: string | undefined;
+  onHand: Quantity;
+  inTransit: Quantity;
+  unitCost?: UnitCost | undefined;
+  currency: string;
+  updatedAt: string;
+}
+
+export const StockLotBalanceSchema: z.ZodType<StockLotBalance, z.ZodTypeDef, unknown> = z.object({
+  lotId: z.string().uuid(),
+  skuId: z.string().uuid(),
+  lotCode: z.string().min(1),
+  mfgDate: zIsoDate.nullable(),
+  expDate: zIsoDate.nullable(),
+  locationId: z.string().uuid(),
+  locationName: z.string().optional(),
+  onHand: zQuantity,
+  inTransit: zQuantity,
+  unitCost: zUnitCost.optional(),
+  currency: z.string().length(3),
+  updatedAt: z.string(),
+});
+
 export interface StockMovement {
   id: string;
   type: StockMovementType;
@@ -37,8 +105,13 @@ export interface StockMovement {
   skuName?: string | undefined;
   locationId: string;
   locationName?: string | undefined;
+  lotId?: string | null | undefined;
+  lotCode?: string | null | undefined;
+  sliceIndex?: number | undefined;
+  movementGroupId?: string | null | undefined;
   quantityDelta: Quantity;
   unitCost?: UnitCost | null | undefined;
+  wacUnitCost?: UnitCost | null | undefined;
   currency: string;
   reasonCategory: string | null;
   note: string | null;
@@ -57,8 +130,13 @@ export const StockMovementSchema: z.ZodType<StockMovement, z.ZodTypeDef, unknown
   skuName: z.string().optional(),
   locationId: z.string().uuid(),
   locationName: z.string().optional(),
+  lotId: z.string().uuid().nullable().optional(),
+  lotCode: z.string().nullable().optional(),
+  sliceIndex: z.number().int().min(0).optional(),
+  movementGroupId: z.string().uuid().nullable().optional(),
   quantityDelta: zQuantity,
   unitCost: zUnitCost.nullable().optional(),
+  wacUnitCost: zUnitCost.nullable().optional(),
   currency: z.string().length(3),
   reasonCategory: z.string().nullable(),
   note: z.string().nullable(),

@@ -9,7 +9,7 @@ import {
   type Sku,
   type Supplier,
 } from '@iv2/shared-domain';
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
 import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
@@ -31,6 +31,11 @@ interface ReceiveLineState {
   quantity: string;
   unitCost: string;
   currency: string;
+  trackLots: boolean;
+  trackExpiry: boolean;
+  lotCode: string;
+  mfgDate: string;
+  expDate: string;
 }
 
 const STATUS_FILTERS: readonly StatusFilter[] = [
@@ -74,6 +79,8 @@ export default function PurchaseOrdersPage() {
   const [receiving, setReceiving] = useState(false);
   const [overReceiveModalOpen, setOverReceiveModalOpen] = useState(false);
   const [overReceiveMessage, setOverReceiveMessage] = useState('');
+
+  const skuById = useMemo(() => new Map(skus.map((s) => [s.id, s])), [skus]);
 
   const loadReferenceData = useCallback(async () => {
     const [supRes, locRes, skuRes] = await Promise.all([
@@ -270,6 +277,7 @@ export default function PurchaseOrdersPage() {
     setReceiveLines(
       po.lines.map((line) => {
         const remaining = Math.max(0, Number(line.orderedQty) - Number(line.fulfilledQty));
+        const sku = skuById.get(line.skuId);
         return {
           orderLineId: line.id,
           skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName ?? ''}` : line.skuId,
@@ -278,6 +286,11 @@ export default function PurchaseOrdersPage() {
           quantity: remaining > 0 ? remaining.toFixed(4) : '0.0000',
           unitCost: line.unitCost ?? '0.0000',
           currency: line.currency,
+          trackLots: sku?.trackLots ?? false,
+          trackExpiry: sku?.trackExpiry ?? false,
+          lotCode: '',
+          mfgDate: '',
+          expDate: '',
         };
       }),
     );
@@ -307,6 +320,13 @@ export default function PurchaseOrdersPage() {
           quantity: l.quantity.trim(),
           unitCost: l.unitCost.trim(),
           currency: l.currency.trim().toUpperCase() || 'USD',
+          ...(l.trackLots
+            ? {
+                lotCode: l.lotCode.trim(),
+                ...(l.mfgDate.trim() ? { mfgDate: l.mfgDate.trim() } : {}),
+                ...(l.expDate.trim() ? { expDate: l.expDate.trim() } : {}),
+              }
+            : {}),
         }));
 
       const res = await apiFetch<ReceivePurchaseOrderResult>(
@@ -601,6 +621,9 @@ export default function PurchaseOrdersPage() {
                     <th>Receive Qty</th>
                     <th>Unit Cost</th>
                     <th>Currency</th>
+                    <th>Lot Code</th>
+                    <th>Mfg Date</th>
+                    <th>Exp Date</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -639,6 +662,50 @@ export default function PurchaseOrdersPage() {
                           }
                           style={{ width: 70, padding: '6px 8px' }}
                         />
+                      </td>
+                      <td>
+                        {line.trackLots ? (
+                          <input
+                            type="text"
+                            placeholder="Required"
+                            value={line.lotCode}
+                            onChange={(e) =>
+                              updateReceiveLine(index, { lotCode: e.target.value })
+                            }
+                            style={{ width: 120, padding: '6px 8px' }}
+                          />
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td>
+                        {line.trackLots ? (
+                          <input
+                            type="date"
+                            value={line.mfgDate}
+                            onChange={(e) =>
+                              updateReceiveLine(index, { mfgDate: e.target.value })
+                            }
+                            style={{ width: 135, padding: '6px 8px' }}
+                          />
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td>
+                        {line.trackLots ? (
+                          <input
+                            type="date"
+                            value={line.expDate}
+                            required={line.trackExpiry}
+                            onChange={(e) =>
+                              updateReceiveLine(index, { expDate: e.target.value })
+                            }
+                            style={{ width: 135, padding: '6px 8px' }}
+                          />
+                        ) : (
+                          '—'
+                        )}
                       </td>
                     </tr>
                   ))}

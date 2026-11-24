@@ -7,12 +7,13 @@ import {
   toUnitCost,
   uuidv7,
 } from '@iv2/shared-domain';
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../../app.js';
 import { OutboxDispatcher } from '../../shared/index.js';
 import { resolvePolicy } from '../iam/public/index.js';
+import { stockLotBalances, stockLots } from './db/index.js';
 import {
   closeTransferDiscrepancy,
   dispatchTransfer,
@@ -648,5 +649,156 @@ describe('inventory stock ledger, projected balances, WAC & concurrency integrat
       ]);
       expect(closed.balances[0]?.inTransit).toBe('0.0000');
     });
+  });
+
+  it('supports lot-tracked receipts, expiry-mismatch rejection, repeat-delivery cost blending, dual costing on movements, and SKU positive-stock guard', async () => {
+    const { app, db, cookie, sku1Id, loc1Id } = await setupFixture();
+
+    // Create a lot-tracked + expiry-tracked SKU
+    const skuLookup = await app.inject({
+      method: 'GET',
+      url: `/api/v1/skus/${sku1Id}`,
+      headers: { cookie },
+    });
+    const baseSku = skuLookup.json().data;
+
+    const lotSkuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId: baseSku.productId,
+        unitOfMeasureId: baseSku.unitOfMeasureId,
+        code: 'LOT-SKU-1',
+        name: 'Lot Tracked Milk',
+        trackLots: true,
+        trackExpiry: true,
+      },
+    });
+    expect(lotSkuRes.statusCode).toBe(201);
+    const lotSkuId = lotSkuRes.json().data.id as string;
+
+    await db.transaction(async (tx) => {
+      // 1. Non-lot SKU receipt persists both unitCost and wacUnitCost
+      const nonLotRes = await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId: sku1Id,
+          locationId: loc1Id,
+          quantityDelta: toQuantity('5'),
+          unitCost: toUnitCost('12.5'),
+          actorId: 'actor-1',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      expect(nonLotRes.movements[0]?.unitCost).toBe('12.5000');
+      expect(nonLotRes.movements[0]?.wacUnitCost).toBe('12.5000');
+      expect(nonLotRes.movements[0]?.lotId ?? null).toBeNull();
+
+      // 2. Lot-tracked SKU without lotCode is rejected
+      await expect(
+        postMovements(tx, [
+          {
+            type: 'RECEIPT',
+            skuId: lotSkuId,
+            locationId: loc1Id,
+            quantityDelta: toQuantity('10'),
+            unitCost: toUnitCost('5'),
+            actorId: 'actor-1',
+            idempotencyKey: uuidv7(),
+          },
+        ]),
+      ).rejects.toMatchObject({ statusCode: 422, code: ERROR_CODES.LOT_CODE_REQUIRED });
+
+      // 3. Lot-tracked + expiry-tracked SKU without expDate is rejected
+      await expect(
+        postMovements(tx, [
+          {
+            type: 'RECEIPT',
+            skuId: lotSkuId,
+            locationId: loc1Id,
+            quantityDelta: toQuantity('10'),
+            unitCost: toUnitCost('5'),
+            lotInput: { lotCode: 'LOT-A', mfgDate: '2026-01-01' },
+            actorId: 'actor-1',
+            idempotencyKey: uuidv7(),
+          },
+        ]),
+      ).rejects.toMatchObject({ statusCode: 422, code: ERROR_CODES.EXPIRY_DATE_REQUIRED });
+
+      // 4. First valid lot receipt: +10 @ 5.0000
+      const firstReceipt = await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId: lotSkuId,
+          locationId: loc1Id,
+          quantityDelta: toQuantity('10'),
+          unitCost: toUnitCost('5'),
+          lotInput: { lotCode: 'LOT-A', mfgDate: '2026-01-01', expDate: '2027-01-01' },
+          actorId: 'actor-1',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      expect(firstReceipt.movements[0]?.lotCode).toBe('LOT-A');
+      expect(firstReceipt.movements[0]?.unitCost).toBe('5.0000');
+      expect(firstReceipt.movements[0]?.wacUnitCost).toBe('5.0000');
+      const createdLotId = firstReceipt.movements[0]!.lotId!;
+      expect(createdLotId).toBeTruthy();
+
+      // 5. Repeat delivery of same lot (case-insensitive) with conflicting expDate is rejected
+      await expect(
+        postMovements(tx, [
+          {
+            type: 'RECEIPT',
+            skuId: lotSkuId,
+            locationId: loc1Id,
+            quantityDelta: toQuantity('5'),
+            unitCost: toUnitCost('6'),
+            lotInput: { lotCode: 'lot-a', expDate: '2027-06-01' },
+            actorId: 'actor-1',
+            idempotencyKey: uuidv7(),
+          },
+        ]),
+      ).rejects.toMatchObject({ statusCode: 422, code: ERROR_CODES.LOT_EXPIRY_MISMATCH });
+
+      // 6. Repeat delivery of same lot with matching expDate and different cost: +20 @ 8.0000
+      const secondReceipt = await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId: lotSkuId,
+          locationId: loc1Id,
+          quantityDelta: toQuantity('20'),
+          unitCost: toUnitCost('8'),
+          lotInput: { lotCode: 'lot-a', expDate: '2027-01-01' },
+          actorId: 'actor-1',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      expect(secondReceipt.movements[0]?.lotId).toBe(createdLotId);
+      expect(secondReceipt.movements[0]?.unitCost).toBe('8.0000');
+      expect(secondReceipt.movements[0]?.wacUnitCost).toBe('7.0000');
+      expect(secondReceipt.balances[0]?.onHand).toBe('30.0000');
+      expect(secondReceipt.balances[0]?.weightedAverageCost).toBe('7.0000');
+
+      const [lotRow] = await tx.select().from(stockLots).where(eq(stockLots.id, createdLotId));
+      expect(lotRow?.lotCode).toBe('LOT-A');
+
+      const [lotBal] = await tx
+        .select()
+        .from(stockLotBalances)
+        .where(eq(stockLotBalances.lotId, createdLotId));
+      expect(lotBal?.onHand).toBe('30.0000');
+      expect(lotBal?.unitCost).toBe('7.0000');
+    });
+
+    // 7. Turning trackLots=true on sku1Id (which now has 5.0000 on hand) is blocked by inventory's positive-stock checker
+    const patchPositive = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${sku1Id}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { trackLots: true },
+    });
+    expect(patchPositive.statusCode).toBe(422);
+    expect(patchPositive.json().error.code).toBe(ERROR_CODES.SKU_HAS_POSITIVE_STOCK);
   });
 });
