@@ -478,6 +478,10 @@ describe('iam auth, session, and Access Switch integration', () => {
         headers: { cookie: owner.cookie },
       });
       expect(auditRes.statusCode).toBe(200);
+      expect(auditRes.json().page).toMatchObject({
+        hasMore: false,
+        nextCursor: null,
+      });
       const logs = auditRes.json().data as Array<{
         action: string;
         resourceType: string;

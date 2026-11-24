@@ -265,12 +265,6 @@ export const CreateStockAdjustmentInputSchema: z.ZodType<
   note: z.string().trim().max(1000).nullable().optional(),
 });
 
-export const ListStockLotBalancesQuerySchema = z.object({
-  skuId: z.string().uuid(),
-  locationId: z.string().uuid(),
-});
-export type ListStockLotBalancesQuery = z.infer<typeof ListStockLotBalancesQuerySchema>;
-
 export const ValuationStatusSchema = z.enum(['NORMAL', 'ESTIMATED_NEGATIVE_STOCK']);
 export type ValuationStatus = z.infer<typeof ValuationStatusSchema>;
 

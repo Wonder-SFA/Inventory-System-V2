@@ -361,7 +361,7 @@ export default function SalesOrdersPage() {
           skuId: line.skuId,
           locationId: so.locationId,
         });
-        void apiFetch<StockLotBalance[]>(`/api/v1/stock-lots/balances?${params.toString()}`)
+        void apiFetch<StockLotBalance[]>(`/api/v1/lot-balances?${params.toString()}`)
           .then((res) => {
             setLotBalancesByLine((prev) => ({ ...prev, [line.orderLineId]: res.data }));
           })

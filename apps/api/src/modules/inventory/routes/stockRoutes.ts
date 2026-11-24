@@ -6,7 +6,6 @@ import {
   FefoPreviewQuerySchema,
   ListLotBalancesQuerySchema,
   ListStockBalancesQuerySchema,
-  ListStockLotBalancesQuerySchema,
   ListStockLotsQuerySchema,
   ListStockMovementsQuerySchema,
   RecentReceiptCostsQuerySchema,
@@ -23,7 +22,6 @@ import {
   getValuationSummary,
   listLotBalances,
   listStockBalances,
-  listStockLotBalances,
   listStockLots,
   listStockMovements,
   previewFefoAllocation,
@@ -94,26 +92,6 @@ export function registerStockRoutes(
   );
 
   typedApp.get(
-    '/api/v1/stock-lots/balances',
-    {
-      schema: {
-        querystring: ListStockLotBalancesQuerySchema,
-      },
-    },
-    async (request) => {
-      const policy = request.accessPolicy!;
-      policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
-      const items = await listStockLotBalances(db, policy.locationScope, request.query);
-      return {
-        data: items.map((item) => policy.redactCosts(item)),
-        meta: {
-          requestId: request.id,
-        },
-      };
-    },
-  );
-
-  typedApp.get(
     '/api/v1/stock-lots',
     {
       schema: {
@@ -122,9 +100,11 @@ export function registerStockRoutes(
     },
     async (request) => {
       const policy = request.accessPolicy!;
-      if (request.query.locationId) {
-        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
-      }
+      policy.assertCan(
+        'read',
+        'stock_balance',
+        request.query.locationId ? { locationId: request.query.locationId } : undefined,
+      );
       const query = request.query;
       const result = await listStockLots(db, policy.locationScope, query);
       return {
@@ -150,9 +130,11 @@ export function registerStockRoutes(
     },
     async (request) => {
       const policy = request.accessPolicy!;
-      if (request.query.locationId) {
-        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
-      }
+      policy.assertCan(
+        'read',
+        'stock_balance',
+        request.query.locationId ? { locationId: request.query.locationId } : undefined,
+      );
       const query = request.query;
       const result = await listLotBalances(db, policy.locationScope, query);
       return {
@@ -178,9 +160,11 @@ export function registerStockRoutes(
     },
     async (request) => {
       const policy = request.accessPolicy!;
-      if (request.query.locationId) {
-        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
-      }
+      policy.assertCan(
+        'read',
+        'stock_balance',
+        request.query.locationId ? { locationId: request.query.locationId } : undefined,
+      );
       const summary = await getValuationSummary(db, policy.locationScope, request.query);
       return {
         data: policy.redactCosts(summary),
@@ -204,6 +188,7 @@ export function registerStockRoutes(
       const lotPolicy = policy.resolveLotPolicy({ locationId: request.query.locationId });
       const preview = await previewFefoAllocation(
         db,
+        policy.locationScope,
         request.query,
         lotPolicy.negativeStockPolicy,
       );
@@ -226,9 +211,11 @@ export function registerStockRoutes(
     },
     async (request) => {
       const policy = request.accessPolicy!;
-      if (request.query.locationId) {
-        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
-      }
+      policy.assertCan(
+        'read',
+        'stock_balance',
+        request.query.locationId ? { locationId: request.query.locationId } : undefined,
+      );
       const result = await getRecentReceiptCosts(
         db,
         policy.locationScope,

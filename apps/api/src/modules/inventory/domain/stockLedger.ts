@@ -12,7 +12,6 @@ import {
   ForbiddenError,
   type ListLotBalancesQuery,
   type ListStockBalancesQuery,
-  type ListStockLotBalancesQuery,
   type ListStockLotsQuery,
   type ListStockMovementsQuery,
   type LotAllocationInput,
@@ -28,7 +27,6 @@ import {
   type RecentReceiptCostsQuery,
   type RecentReceiptCostsResult,
   type StockBalance,
-  type StockLotBalance,
   type StockLotView,
   type StockMovement,
   type StockMovementType,
@@ -91,7 +89,6 @@ import {
 import {
   findSkuByIdOrCode,
   getSkusByIds,
-  registerSkuPositiveStockChecker,
   registerSkuReferenceChecker,
 } from '../../catalog/public/index.js';
 import type { LocationScope } from '../../iam/public/index.js';
@@ -368,6 +365,32 @@ function collectStockWarnings(state: LockedBalanceState): ApiWarning[] {
     });
   }
   return warnings;
+}
+
+function validateLotAllocationsSum(
+  lotAllocations: readonly { lotId: UUID; quantity: Quantity }[],
+  expectedQty: Quantity,
+  verb: 'issued' | 'dispatched',
+): void {
+  let allocatedSum = toQuantity(ZERO_DECIMAL4);
+  const seenLotIds = new Set<string>();
+  for (const alloc of lotAllocations) {
+    if (seenLotIds.has(alloc.lotId)) {
+      throw new ValidationError(
+        ERROR_CODES.VALIDATION_ERROR,
+        `Duplicate lotId ${alloc.lotId} in lotAllocations`,
+      );
+    }
+    seenLotIds.add(alloc.lotId);
+    allocatedSum = add(allocatedSum, alloc.quantity);
+  }
+
+  if (!isZero(sub(allocatedSum, expectedQty))) {
+    throw new ValidationError(
+      ERROR_CODES.LOT_ALLOCATION_MISMATCH,
+      `Lot allocations sum (${allocatedSum}) must equal ${verb} quantity (${expectedQty})`,
+    );
+  }
 }
 
 function toStockMovementDto(
@@ -842,34 +865,20 @@ export async function postMovements(
           );
         }
 
-        const expectedQty = abs(line.quantityDelta);
-        let allocatedSum = toQuantity(ZERO_DECIMAL4);
-        const seenLotIds = new Set<string>();
-        for (const alloc of line.lotAllocations) {
-          if (seenLotIds.has(alloc.lotId)) {
-            throw new ValidationError(
-              ERROR_CODES.VALIDATION_ERROR,
-              `Duplicate lotId ${alloc.lotId} in lotAllocations`,
-            );
-          }
-          seenLotIds.add(alloc.lotId);
-          allocatedSum = add(allocatedSum, alloc.quantity);
-        }
-
-        if (!isZero(sub(allocatedSum, expectedQty))) {
-          throw new ValidationError(
-            ERROR_CODES.LOT_ALLOCATION_MISMATCH,
-            `Lot allocations sum (${allocatedSum}) must equal issued quantity (${expectedQty})`,
-          );
-        }
+        validateLotAllocationsSum(line.lotAllocations, abs(line.quantityDelta), 'issued');
 
         const lotEntries = lockedLotMap.get(key) ?? [];
         const lotEntryById = new Map(lotEntries.map((e) => [e.lotId, e]));
-        const resolvedAllocations: Array<{
-          entry: (typeof lotEntries)[number];
+        interface ResolvedSlice {
+          entry: (typeof lotEntries)[number] | null;
+          lotId: UUID | null;
+          lotCode: string | null;
+          expDate: string | null;
           quantity: Quantity;
+          unitCost: UnitCost;
           isExpired: boolean;
-        }> = [];
+        }
+        const resolvedSlices: ResolvedSlice[] = [];
 
         for (const alloc of line.lotAllocations) {
           const entry = lotEntryById.get(alloc.lotId);
@@ -903,31 +912,68 @@ export async function postMovements(
             }
           }
 
-          resolvedAllocations.push({ entry, quantity: alloc.quantity, isExpired });
+          if (lt(entry.onHand, alloc.quantity)) {
+            const lotDeduct = isPositive(entry.onHand) ? entry.onHand : toQuantity(ZERO_DECIMAL4);
+            const shortfall = sub(alloc.quantity, lotDeduct);
+            if (isPositive(lotDeduct)) {
+              resolvedSlices.push({
+                entry,
+                lotId: entry.lotId,
+                lotCode: entry.lotCode,
+                expDate: entry.expDate,
+                quantity: lotDeduct,
+                unitCost: entry.unitCost,
+                isExpired,
+              });
+            }
+            if (isPositive(shortfall)) {
+              resolvedSlices.push({
+                entry: null,
+                lotId: null,
+                lotCode: null,
+                expDate: null,
+                quantity: shortfall,
+                unitCost: line.unitCost ?? oldWac,
+                isExpired: false,
+              });
+            }
+          } else {
+            resolvedSlices.push({
+              entry,
+              lotId: entry.lotId,
+              lotCode: entry.lotCode,
+              expDate: entry.expDate,
+              quantity: alloc.quantity,
+              unitCost: entry.unitCost,
+              isExpired,
+            });
+          }
         }
 
         const groupId =
-          resolvedAllocations.length > 1 ? (line.movementGroupId ?? uuidv7()) : (line.movementGroupId ?? null);
+          resolvedSlices.length > 1 ? (line.movementGroupId ?? uuidv7()) : (line.movementGroupId ?? null);
 
         state.onHand = newQty;
         state.available = sub(state.onHand, state.reserved);
         if (line.currency) state.currency = line.currency;
         dirtyKeys.add(key);
 
-        for (let idx = 0; idx < resolvedAllocations.length; idx++) {
-          const { entry, quantity, isExpired } = resolvedAllocations[idx]!;
-          entry.onHand = sub(entry.onHand, quantity);
-          await tx
-            .update(stockLotBalances)
-            .set({ onHand: entry.onHand, updatedAt: new Date() })
-            .where(
-              and(
-                eq(stockLotBalances.lotId, entry.lotId),
-                eq(stockLotBalances.locationId, line.locationId),
-              ),
-            );
+        for (let idx = 0; idx < resolvedSlices.length; idx++) {
+          const slice = resolvedSlices[idx]!;
+          if (slice.entry) {
+            slice.entry.onHand = sub(slice.entry.onHand, slice.quantity);
+            await tx
+              .update(stockLotBalances)
+              .set({ onHand: slice.entry.onHand, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(stockLotBalances.lotId, slice.entry.lotId),
+                  eq(stockLotBalances.locationId, line.locationId),
+                ),
+              );
+          }
 
-          const recordedUnitCost = entry.unitCost;
+          const recordedUnitCost = slice.unitCost;
           const recordedWacUnitCost = oldWac;
 
           const [row] = await tx
@@ -937,10 +983,10 @@ export async function postMovements(
               type: line.type,
               skuId: line.skuId,
               locationId: line.locationId,
-              lotId: entry.lotId,
+              lotId: slice.lotId,
               sliceIndex: idx,
               movementGroupId: groupId,
-              quantityDelta: negate(quantity),
+              quantityDelta: negate(slice.quantity),
               unitCost: recordedUnitCost,
               wacUnitCost: recordedWacUnitCost,
               currency: effectiveCurrency,
@@ -951,22 +997,22 @@ export async function postMovements(
               actorId: line.actorId,
               idempotencyKey: line.idempotencyKey,
               eodReconciliationRequired: false,
-              expiredLotOverride: isExpired,
-              overrideReason: isExpired ? (line.overrideReason ?? null) : null,
+              expiredLotOverride: slice.isExpired,
+              overrideReason: slice.isExpired ? (line.overrideReason ?? null) : null,
             })
             .returning();
 
-          const dto = toStockMovementDto(row!, undefined, undefined, entry.lotCode);
+          const dto = toStockMovementDto(row!, undefined, undefined, slice.lotCode);
           insertedMovements.push(dto);
 
-          if (isExpired) {
+          if (slice.isExpired && slice.lotId && slice.lotCode) {
             warnings.push({
               code: WARNING_CODES.EXPIRED_LOT_OVERRIDE_USED,
-              message: `Issued expired lot ${entry.lotCode} (expired ${entry.expDate}) with authorized override.`,
+              message: `Issued expired lot ${slice.lotCode} (expired ${slice.expDate}) with authorized override.`,
               skuId: line.skuId,
               locationId: line.locationId,
-              lotId: entry.lotId,
-              lotCode: entry.lotCode,
+              lotId: slice.lotId,
+              lotCode: slice.lotCode,
             });
           }
 
@@ -1057,6 +1103,13 @@ export async function postMovements(
             `Stock lot ${line.lotId} not found at location ${line.locationId}`,
           );
         }
+        const requestedQty = abs(line.quantityDelta);
+        if (negativeStockPolicy === 'STRICT_BLOCK' && lt(entry.onHand, requestedQty)) {
+          throw new ValidationError(
+            ERROR_CODES.INSUFFICIENT_LOT_STOCK,
+            `Insufficient stock in lot ${entry.lotCode} (on hand ${entry.onHand}, requested ${requestedQty})`,
+          );
+        }
         const isExpired = entry.expDate !== null && entry.expDate < today;
         if (isExpired) {
           if (!line.allowExpiredLotOverride) {
@@ -1072,69 +1125,119 @@ export async function postMovements(
             );
           }
         }
-        entry.onHand = add(entry.onHand, line.quantityDelta);
-        await tx
-          .update(stockLotBalances)
-          .set({ onHand: entry.onHand, updatedAt: new Date() })
-          .where(
-            and(
-              eq(stockLotBalances.lotId, entry.lotId),
-              eq(stockLotBalances.locationId, line.locationId),
-            ),
-          );
 
-        const recordedUnitCost = entry.unitCost;
-        const recordedWacUnitCost = oldWac;
+        const singleSlices: Array<{
+          entry: (typeof lotEntries)[number] | null;
+          lotId: UUID | null;
+          lotCode: string | null;
+          quantity: Quantity;
+          unitCost: UnitCost;
+          isExpired: boolean;
+        }> = [];
+        if (lt(entry.onHand, requestedQty)) {
+          const lotDeduct = isPositive(entry.onHand) ? entry.onHand : toQuantity(ZERO_DECIMAL4);
+          const shortfall = sub(requestedQty, lotDeduct);
+          if (isPositive(lotDeduct)) {
+            singleSlices.push({
+              entry,
+              lotId: entry.lotId,
+              lotCode: entry.lotCode,
+              quantity: lotDeduct,
+              unitCost: entry.unitCost,
+              isExpired,
+            });
+          }
+          if (isPositive(shortfall)) {
+            singleSlices.push({
+              entry: null,
+              lotId: null,
+              lotCode: null,
+              quantity: shortfall,
+              unitCost: line.unitCost ?? oldWac,
+              isExpired: false,
+            });
+          }
+        } else {
+          singleSlices.push({
+            entry,
+            lotId: entry.lotId,
+            lotCode: entry.lotCode,
+            quantity: requestedQty,
+            unitCost: entry.unitCost,
+            isExpired,
+          });
+        }
+
+        const groupId =
+          singleSlices.length > 1 ? (line.movementGroupId ?? uuidv7()) : (line.movementGroupId ?? null);
+
         state.onHand = newQty;
         state.available = sub(state.onHand, state.reserved);
         if (line.currency) state.currency = line.currency;
         dirtyKeys.add(key);
 
-        const [row] = await tx
-          .insert(stockMovements)
-          .values({
-            id: line.id ?? uuidv7(),
-            type: line.type,
-            skuId: line.skuId,
-            locationId: line.locationId,
-            lotId: entry.lotId,
-            sliceIndex: line.sliceIndex ?? 0,
-            movementGroupId: line.movementGroupId ?? null,
-            quantityDelta: line.quantityDelta,
-            unitCost: recordedUnitCost,
-            wacUnitCost: recordedWacUnitCost,
-            currency: effectiveCurrency,
-            reasonCategory: line.reasonCategory ?? null,
-            note: line.note ?? null,
-            referenceType: line.referenceType ?? null,
-            referenceId: line.referenceId ?? null,
-            actorId: line.actorId,
-            idempotencyKey: line.idempotencyKey,
-            eodReconciliationRequired: false,
-            expiredLotOverride: isExpired,
-            overrideReason: isExpired ? (line.overrideReason ?? null) : null,
-          })
-          .returning();
+        for (let idx = 0; idx < singleSlices.length; idx++) {
+          const slice = singleSlices[idx]!;
+          if (slice.entry) {
+            slice.entry.onHand = sub(slice.entry.onHand, slice.quantity);
+            await tx
+              .update(stockLotBalances)
+              .set({ onHand: slice.entry.onHand, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(stockLotBalances.lotId, slice.entry.lotId),
+                  eq(stockLotBalances.locationId, line.locationId),
+                ),
+              );
+          }
 
-        const dto = toStockMovementDto(row!, undefined, undefined, entry.lotCode);
-        insertedMovements.push(dto);
-        if (isExpired) {
-          warnings.push({
-            code: WARNING_CODES.EXPIRED_LOT_OVERRIDE_USED,
-            message: `Issued expired lot ${entry.lotCode} (expired ${entry.expDate}) with authorized override.`,
-            skuId: line.skuId,
-            locationId: line.locationId,
-            lotId: entry.lotId,
-            lotCode: entry.lotCode,
+          const [row] = await tx
+            .insert(stockMovements)
+            .values({
+              id: idx === 0 && line.id ? line.id : uuidv7(),
+              type: line.type,
+              skuId: line.skuId,
+              locationId: line.locationId,
+              lotId: slice.lotId,
+              sliceIndex: line.sliceIndex ?? idx,
+              movementGroupId: groupId,
+              quantityDelta: negate(slice.quantity),
+              unitCost: slice.unitCost,
+              wacUnitCost: oldWac,
+              currency: effectiveCurrency,
+              reasonCategory: line.reasonCategory ?? null,
+              note: line.note ?? null,
+              referenceType: line.referenceType ?? null,
+              referenceId: line.referenceId ?? null,
+              actorId: line.actorId,
+              idempotencyKey: line.idempotencyKey,
+              eodReconciliationRequired: false,
+              expiredLotOverride: slice.isExpired,
+              overrideReason: slice.isExpired ? (line.overrideReason ?? null) : null,
+            })
+            .returning();
+
+          const dto = toStockMovementDto(row!, undefined, undefined, slice.lotCode);
+          insertedMovements.push(dto);
+          if (slice.isExpired && slice.lotId && slice.lotCode) {
+            warnings.push({
+              code: WARNING_CODES.EXPIRED_LOT_OVERRIDE_USED,
+              message: `Issued expired lot ${slice.lotCode} (expired ${entry.expDate}) with authorized override.`,
+              skuId: line.skuId,
+              locationId: line.locationId,
+              lotId: slice.lotId,
+              lotCode: slice.lotCode,
+            });
+          }
+          await emitOutboxEvent(tx, options?.emit, {
+            eventType: eventTypeForMovement(line.type),
+            aggregateType: 'stock_movement',
+            aggregateId: dto.id,
+            payload: dto,
           });
         }
+
         warnings.push(...collectStockWarnings(state));
-        await emitOutboxEvent(tx, options?.emit, {
-          eventType: eventTypeForMovement(line.type),
-          aggregateType: 'stock_movement',
-          aggregateId: dto.id,
-          payload: dto,
-        });
         continue;
       }
 
@@ -1498,25 +1601,7 @@ export async function dispatchTransfer(
         );
       }
 
-      let allocatedSum = toQuantity(ZERO_DECIMAL4);
-      const seenLotIds = new Set<string>();
-      for (const alloc of line.lotAllocations) {
-        if (seenLotIds.has(alloc.lotId)) {
-          throw new ValidationError(
-            ERROR_CODES.VALIDATION_ERROR,
-            `Duplicate lotId ${alloc.lotId} in lotAllocations`,
-          );
-        }
-        seenLotIds.add(alloc.lotId);
-        allocatedSum = add(allocatedSum, alloc.quantity);
-      }
-
-      if (!isZero(sub(allocatedSum, line.quantity))) {
-        throw new ValidationError(
-          ERROR_CODES.LOT_ALLOCATION_MISMATCH,
-          `Lot allocations sum (${allocatedSum}) must equal dispatched quantity (${line.quantity})`,
-        );
-      }
+      validateLotAllocationsSum(line.lotAllocations, line.quantity, 'dispatched');
 
       for (const alloc of line.lotAllocations) {
         const entry = srcLotById.get(alloc.lotId);
@@ -1547,15 +1632,42 @@ export async function dispatchTransfer(
             );
           }
         }
-        slicesToDispatch.push({
-          lotId: entry.lotId,
-          lotCode: entry.lotCode,
-          expDate: entry.expDate,
-          quantity: alloc.quantity,
-          dispatchUnitCost: entry.unitCost,
-          isExpired,
-          eodReconciliationRequired: false,
-        });
+        if (lt(entry.onHand, alloc.quantity)) {
+          const lotDeduct = isPositive(entry.onHand) ? entry.onHand : toQuantity(ZERO_DECIMAL4);
+          const shortfall = sub(alloc.quantity, lotDeduct);
+          if (isPositive(lotDeduct)) {
+            slicesToDispatch.push({
+              lotId: entry.lotId,
+              lotCode: entry.lotCode,
+              expDate: entry.expDate,
+              quantity: lotDeduct,
+              dispatchUnitCost: entry.unitCost,
+              isExpired,
+              eodReconciliationRequired: false,
+            });
+          }
+          if (isPositive(shortfall)) {
+            slicesToDispatch.push({
+              lotId: null,
+              lotCode: null,
+              expDate: null,
+              quantity: shortfall,
+              dispatchUnitCost: srcWac,
+              isExpired: false,
+              eodReconciliationRequired: false,
+            });
+          }
+        } else {
+          slicesToDispatch.push({
+            lotId: entry.lotId,
+            lotCode: entry.lotCode,
+            expDate: entry.expDate,
+            quantity: alloc.quantity,
+            dispatchUnitCost: entry.unitCost,
+            isExpired,
+            eodReconciliationRequired: false,
+          });
+        }
       }
     } else if (pickingMode === 'MANUAL_REQUIRED') {
       throw new ValidationError(
@@ -2169,52 +2281,6 @@ export async function recordManualIssue(
     })),
     warnings: result.warnings,
   };
-}
-
-export async function listStockLotBalances(
-  db: Database | DbTransaction,
-  scope: LocationScope,
-  query: ListStockLotBalancesQuery,
-): Promise<StockLotBalance[]> {
-  if ('locationIds' in scope && !scope.locationIds.includes(query.locationId)) {
-    return [];
-  }
-
-  const rows = await db
-    .select({
-      lotId: stockLots.id,
-      skuId: stockLots.skuId,
-      lotCode: stockLots.lotCode,
-      mfgDate: stockLots.mfgDate,
-      expDate: stockLots.expDate,
-      locationId: stockLotBalances.locationId,
-      locationName: locations.name,
-      onHand: stockLotBalances.onHand,
-      inTransit: stockLotBalances.inTransit,
-      unitCost: stockLotBalances.unitCost,
-      currency: stockLotBalances.currency,
-      updatedAt: stockLotBalances.updatedAt,
-    })
-    .from(stockLotBalances)
-    .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
-    .innerJoin(locations, eq(stockLotBalances.locationId, locations.id))
-    .where(and(eq(stockLots.skuId, query.skuId), eq(stockLotBalances.locationId, query.locationId)))
-    .orderBy(asc(stockLots.expDate), asc(stockLots.createdAt));
-
-  return rows.map((row) => ({
-    lotId: row.lotId,
-    skuId: row.skuId,
-    lotCode: row.lotCode,
-    mfgDate: row.mfgDate ?? null,
-    expDate: row.expDate ?? null,
-    locationId: row.locationId,
-    locationName: row.locationName,
-    onHand: toQuantity(row.onHand),
-    inTransit: toQuantity(row.inTransit),
-    unitCost: toUnitCost(row.unitCost),
-    currency: row.currency,
-    updatedAt: row.updatedAt.toISOString(),
-  }));
 }
 
 function buildExpiryStatusCondition(
@@ -3121,33 +3187,31 @@ async function hasInventoryLocationReferences(
   return Boolean(bal);
 }
 
-async function hasInventoryPositiveOnHandStock(
-  db: Database | DbTransaction,
-  skuId: string,
-): Promise<boolean> {
-  const [bal] = await db
-    .select({ skuId: stockBalances.skuId })
-    .from(stockBalances)
-    .where(and(eq(stockBalances.skuId, skuId), sql`${stockBalances.onHand} > 0`))
-    .limit(1);
-  return Boolean(bal);
-}
-
 export function registerInventoryReferenceCheckers(): void {
   if (referenceCheckersRegistered) {
     return;
   }
   registerSkuReferenceChecker(hasInventorySkuReferences);
-  registerSkuPositiveStockChecker(hasInventoryPositiveOnHandStock);
   registerLocationReferenceChecker(hasInventoryLocationReferences);
   referenceCheckersRegistered = true;
 }
 
 export async function previewFefoAllocation(
   db: Database | DbTransaction,
+  locationScope: LocationScope,
   query: FefoPreviewQuery,
   negativeStockPolicy: LotNegativeStockPolicy = 'FLEXIBLE_UNASSIGNED',
 ): Promise<PlanFefoAllocationResult> {
+  const isLocationAllowed =
+    ('allLocations' in locationScope && locationScope.allLocations) ||
+    ('locationIds' in locationScope && locationScope.locationIds.includes(query.locationId));
+  if (!isLocationAllowed) {
+    throw new ForbiddenError(
+      ERROR_CODES.FORBIDDEN,
+      'Actor does not have access to the requested location',
+    );
+  }
+
   const [bal] = await db
     .select({ onHand: stockBalances.onHand })
     .from(stockBalances)

@@ -531,7 +531,7 @@ export async function shipSalesOrder(
   const lotPolicy = options.resolveLotPolicy ? options.resolveLotPolicy(so.locationId) : undefined;
   const allowManualFefoOverride = options.canManualFefoOverride
     ? options.canManualFefoOverride(so.locationId)
-    : true;
+    : false;
   const lineOccurrenceCount = new Map<string, number>();
   const movementLines: PostMovementLine[] = input.lines.map((reqLine) => {
     const line = lineById.get(reqLine.orderLineId)!;

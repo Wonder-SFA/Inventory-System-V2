@@ -8,7 +8,6 @@ import { outboxEvents } from '../../shared/db/schema.js';
 import {
   findSkuByIdOrCode,
   getSkusByIds,
-  registerSkuPositiveStockChecker,
   registerSkuReferenceChecker,
 } from './public/index.js';
 
@@ -602,23 +601,16 @@ describe('catalog module integration', () => {
     expect(invalidPatch.statusCode).toBe(422);
     expect(invalidPatch.json().error.code).toBe(ERROR_CODES.INVALID_LOT_CONFIGURATION);
 
-    // 5. Turning trackLots=true on a SKU with positive on-hand stock succeeds (hybrid cutover)
-    const unregisterPositive = registerSkuPositiveStockChecker(
-      async (_db, id) => id === defaultSku.id,
-    );
-    try {
-      const enabledWithStock = await app.inject({
-        method: 'PATCH',
-        url: `/api/v1/skus/${defaultSku.id}`,
-        headers: { cookie, 'idempotency-key': uuidv7() },
-        payload: { trackLots: true, trackExpiry: true },
-      });
-      expect(enabledWithStock.statusCode).toBe(200);
-      expect(enabledWithStock.json().data.trackLots).toBe(true);
-      expect(enabledWithStock.json().data.trackExpiry).toBe(true);
-    } finally {
-      unregisterPositive();
-    }
+    // 5. Turning trackLots=true on an existing SKU succeeds (hybrid cutover)
+    const enabledWithStock = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${defaultSku.id}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { trackLots: true, trackExpiry: true },
+    });
+    expect(enabledWithStock.statusCode).toBe(200);
+    expect(enabledWithStock.json().data.trackLots).toBe(true);
+    expect(enabledWithStock.json().data.trackExpiry).toBe(true);
 
     // 6. Lookup returns the updated flags
 

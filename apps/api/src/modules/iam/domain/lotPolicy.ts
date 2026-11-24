@@ -1,6 +1,7 @@
 import type { Database } from '@iv2/db';
 import {
   type ActorRole,
+  type CursorPaginationQuery,
   ERROR_CODES,
   ForbiddenError,
   type IamAuditLog,
@@ -8,7 +9,8 @@ import {
   type UpsertLotPolicyInput,
   uuidv7,
 } from '@iv2/shared-domain';
-import { and, asc, desc, eq } from 'drizzle-orm';
+import { and, asc, eq } from 'drizzle-orm';
+import { applyKeysetOrder, paginateKeysetResult } from '../../../shared/http/pagination.js';
 import type { DbTransaction } from '../../../shared/outbox/index.js';
 import { iamAuditLogs, iamLotPolicies, iamUsers } from '../db/index.js';
 import type { AccessPolicy } from './accessPolicy.js';
@@ -118,21 +120,36 @@ export async function upsertLotPolicy(
   return afterState;
 }
 
-export async function listAuditLogs(db: Database): Promise<IamAuditLog[]> {
+export async function listAuditLogs(
+  db: Database,
+  query: CursorPaginationQuery = { limit: 50 },
+): Promise<{ items: IamAuditLog[]; nextCursor: string | null; hasMore: boolean }> {
+  const limit = query.limit ?? 50;
+  const { orderBy, where } = applyKeysetOrder(
+    iamAuditLogs.createdAt,
+    iamAuditLogs.id,
+    query.cursor,
+  );
   const rows = await db
     .select()
     .from(iamAuditLogs)
-    .orderBy(desc(iamAuditLogs.createdAt), desc(iamAuditLogs.id))
-    .limit(100);
+    .where(where)
+    .orderBy(...orderBy)
+    .limit(limit + 1);
 
-  return rows.map((row) => ({
-    id: row.id,
-    actorId: row.actorId,
-    action: row.action,
-    resourceType: row.resourceType,
-    resourceId: row.resourceId,
-    beforeState: row.beforeState,
-    afterState: row.afterState,
-    createdAt: row.createdAt.toISOString(),
-  }));
+  const page = paginateKeysetResult(rows, limit);
+  return {
+    items: page.items.map((row) => ({
+      id: row.id,
+      actorId: row.actorId,
+      action: row.action,
+      resourceType: row.resourceType,
+      resourceId: row.resourceId,
+      beforeState: row.beforeState,
+      afterState: row.afterState,
+      createdAt: row.createdAt.toISOString(),
+    })),
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+  };
 }
