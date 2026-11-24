@@ -1,8 +1,10 @@
 import type { Database } from '@iv2/db';
 import {
   CreateStockAdjustmentInputSchema,
+  CreateStockIssueInputSchema,
   FefoPreviewQuerySchema,
   ListStockBalancesQuerySchema,
+  ListStockLotBalancesQuerySchema,
   ListStockMovementsQuerySchema,
   uuidv7,
 } from '@iv2/shared-domain';
@@ -11,9 +13,11 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { type OutboxDispatcher, executeCommand } from '../../../shared/index.js';
 import {
   listStockBalances,
+  listStockLotBalances,
   listStockMovements,
   previewFefoAllocation,
   recordManualAdjustment,
+  recordManualIssue,
 } from '../domain/index.js';
 
 export interface RegisterStockRoutesOptions {
@@ -79,6 +83,26 @@ export function registerStockRoutes(
   );
 
   typedApp.get(
+    '/api/v1/stock-lots/balances',
+    {
+      schema: {
+        querystring: ListStockLotBalancesQuerySchema,
+      },
+    },
+    async (request) => {
+      const policy = request.accessPolicy!;
+      policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
+      const items = await listStockLotBalances(db, policy.locationScope, request.query);
+      return {
+        data: items.map((item) => policy.redactCosts(item)),
+        meta: {
+          requestId: request.id,
+        },
+      };
+    },
+  );
+
+  typedApp.get(
     '/api/v1/stock-lots/fefo-preview',
     {
       schema: {
@@ -135,6 +159,7 @@ export function registerStockRoutes(
               {
                 skuId: request.body.skuId,
                 locationId: request.body.locationId,
+                lotId: request.body.lotId,
                 quantityDelta: request.body.quantityDelta,
                 reasonCategory: request.body.reasonCategory,
                 unitCost: request.body.unitCost,
@@ -156,6 +181,85 @@ export function registerStockRoutes(
 
             return {
               data: policy.redactCosts(recorded.movement),
+              warnings: recorded.warnings,
+              statusCode: 201,
+            };
+          },
+        },
+        {
+          db,
+          outboxDispatcher,
+          requestId: request.id,
+          getAccessSwitch: () => request.accessSwitch ?? 'ACTIVE',
+        },
+      );
+
+      return reply.status(result.statusCode).send(result.body);
+    },
+  );
+
+  typedApp.post(
+    '/api/v1/stock-movements/issues',
+    {
+      schema: {
+        body: CreateStockIssueInputSchema,
+      },
+    },
+    async (request, reply) => {
+      const policy = request.accessPolicy!;
+      const result = await executeCommand(
+        {
+          actorId: policy.actor.id,
+          method: request.method,
+          path: request.url,
+          payload: request.body,
+          idempotencyKey: request.headers['idempotency-key'] as string | undefined,
+          accessPolicy: policy,
+          permission: {
+            action: 'issue',
+            resource: 'stock_movement',
+            context: {
+              locationId: request.body.locationId,
+              quantity: request.body.quantity,
+            },
+          },
+          handler: async (ctx) => {
+            const movementIdempotencyKey = ctx.idempotencyKey ?? uuidv7();
+            const lotPolicy = policy.resolveLotPolicy({ locationId: request.body.locationId });
+            const allowManualFefoOverride = policy.canManualFefoOverride({
+              locationId: request.body.locationId,
+            });
+            const recorded = await recordManualIssue(
+              ctx.tx,
+              {
+                skuId: request.body.skuId,
+                locationId: request.body.locationId,
+                quantity: request.body.quantity,
+                currency: request.body.currency,
+                note: request.body.note,
+                lotAllocations: request.body.lotAllocations,
+                confirmExpiredLotOverride: request.body.confirmExpiredLotOverride,
+                overrideReason: request.body.overrideReason,
+                actorId: policy.actor.id,
+                idempotencyKey: movementIdempotencyKey,
+              },
+              {
+                emit: ctx.emit,
+                pickingMode: lotPolicy.pickingMode,
+                negativeStockPolicy: lotPolicy.negativeStockPolicy,
+                allowManualFefoOverride,
+                allowExpiredLotOverride: lotPolicy.allowExpiredLotOverride,
+                assertCanPushNegative: (locationId) => {
+                  policy.assertCan('issue', 'stock_movement', {
+                    locationId,
+                    pushesStockNegative: true,
+                  });
+                },
+              },
+            );
+
+            return {
+              data: recorded.movements.map((m) => policy.redactCosts(m)),
               warnings: recorded.warnings,
               statusCode: 201,
             };

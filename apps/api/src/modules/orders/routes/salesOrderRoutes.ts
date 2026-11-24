@@ -230,6 +230,7 @@ export function registerSalesOrderRoutes(
               deriveLineIdempotencyKey: ctx.deriveLineIdempotencyKey,
               emit: ctx.emit,
               resolveLotPolicy: (locationId) => policy.resolveLotPolicy({ locationId }),
+              canManualFefoOverride: (locationId) => policy.canManualFefoOverride({ locationId }),
             });
             return {
               data: policy.redactCosts(shipped.result),

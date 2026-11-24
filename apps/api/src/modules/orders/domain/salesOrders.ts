@@ -450,8 +450,10 @@ export async function shipSalesOrder(
     emit?: OrderEmitEventFn;
     resolveLotPolicy?: (locationId: string) => {
       pickingMode: 'AUTO_FEFO' | 'MANUAL_REQUIRED' | 'MANUAL_OPTIONAL';
+      allowExpiredLotOverride?: boolean;
       negativeStockPolicy: 'FLEXIBLE_UNASSIGNED' | 'STRICT_BLOCK';
     };
+    canManualFefoOverride?: (locationId: string) => boolean;
   },
 ): Promise<{ result: ShipSalesOrderResult; warnings: ApiWarning[] }> {
   const [so] = await tx
@@ -527,6 +529,9 @@ export async function shipSalesOrder(
   await releaseReservation(tx, releaseLines, { emit: options.emit });
 
   const lotPolicy = options.resolveLotPolicy ? options.resolveLotPolicy(so.locationId) : undefined;
+  const allowManualFefoOverride = options.canManualFefoOverride
+    ? options.canManualFefoOverride(so.locationId)
+    : true;
   const lineOccurrenceCount = new Map<string, number>();
   const movementLines: PostMovementLine[] = input.lines.map((reqLine) => {
     const line = lineById.get(reqLine.orderLineId)!;
@@ -538,8 +543,14 @@ export async function shipSalesOrder(
       type: 'ISSUE',
       skuId: line.skuId,
       locationId: so.locationId,
+      lotAllocations: reqLine.lotAllocations,
       pickingMode: lotPolicy?.pickingMode,
       negativeStockPolicy: lotPolicy?.negativeStockPolicy,
+      allowManualFefoOverride,
+      allowExpiredLotOverride: lotPolicy?.allowExpiredLotOverride ?? false,
+      confirmExpiredLotOverride:
+        reqLine.confirmExpiredLotOverride ?? input.confirmExpiredLotOverride ?? false,
+      overrideReason: reqLine.overrideReason ?? input.overrideReason ?? null,
       quantityDelta: negate(reqLine.quantity) as Quantity,
       currency: line.currency,
       note: input.note ?? null,

@@ -41,6 +41,7 @@ export interface AccessPolicy {
   assertCan(action: string, resource: string, context?: AccessContext): void;
   redactCosts<T>(dto: T): T;
   resolveLotPolicy(context?: { readonly locationId?: string | undefined }): EffectiveLotPolicy;
+  canManualFefoOverride(context?: { readonly locationId?: string | undefined }): boolean;
 }
 
 export interface ResolvePolicyOverrides {
@@ -65,6 +66,8 @@ const REDACTED_COST_KEYS = new Set([
   'suggestedUnitCost',
   'recentUnitCost',
 ]);
+
+const MANUAL_FEFO_OVERRIDE_ROLES = new Set<ActorRole>(['OWNER', 'SUPER_ADMIN', 'ADMIN', 'MANAGER']);
 
 const DEFAULT_EFFECTIVE_LOT_POLICY: EffectiveLotPolicy = {
   pickingMode: 'AUTO_FEFO',
@@ -181,6 +184,15 @@ export function resolvePolicy(actor: Actor, overrides?: ResolvePolicyOverrides):
         negativeStockPolicy:
           negativeStockPolicy ?? DEFAULT_EFFECTIVE_LOT_POLICY.negativeStockPolicy,
       };
+    },
+    canManualFefoOverride(context?: { readonly locationId?: string | undefined }): boolean {
+      if (deniedActions.has('manual_override:stock_lot') || deniedActions.has('manual_override')) {
+        return false;
+      }
+      if (context?.locationId !== undefined && !isLocationAllowed(locationScope, context.locationId)) {
+        return false;
+      }
+      return MANUAL_FEFO_OVERRIDE_ROLES.has(actorRole);
     },
   };
 }

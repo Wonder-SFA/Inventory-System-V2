@@ -3,6 +3,7 @@ import type { LocationStatus, StockMovementType } from '@iv2/shared-domain';
 import { type SQL, sql } from 'drizzle-orm';
 import {
   type AnyPgColumn,
+  boolean,
   char,
   date,
   index,
@@ -110,6 +111,9 @@ export const stockMovements = inventorySchema.table(
     referenceId: uuid('reference_id'),
     actorId: text('actor_id').notNull(),
     idempotencyKey: uuid('idempotency_key').notNull(),
+    eodReconciliationRequired: boolean('eod_reconciliation_required').notNull().default(false),
+    expiredLotOverride: boolean('expired_lot_override').notNull().default(false),
+    overrideReason: text('override_reason'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [

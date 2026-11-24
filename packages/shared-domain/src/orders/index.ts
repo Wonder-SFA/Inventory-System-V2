@@ -10,7 +10,13 @@ import {
   zUnitCost,
 } from '../decimal/index.js';
 import { CursorPaginationQuerySchema } from '../http/index.js';
-import { StockMovementSchema, zIsoDate } from '../stock/index.js';
+import {
+  type LotAllocationInput,
+  LotAllocationInputSchema,
+  type LotAllocationRawInput,
+  StockMovementSchema,
+  zIsoDate,
+} from '../stock/index.js';
 
 export const SupplierStatusSchema = z.enum(['ACTIVE', 'ARCHIVED']);
 export type SupplierStatus = z.infer<typeof SupplierStatusSchema>;
@@ -478,11 +484,17 @@ export type ListSalesOrdersQuery = z.infer<typeof ListSalesOrdersQuerySchema>;
 export interface ShipSalesOrderLineInput {
   orderLineId: string;
   quantity: Quantity;
+  lotAllocations?: LotAllocationInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
 }
 
 export interface ShipSalesOrderLineRawInput {
   orderLineId: string;
   quantity: string;
+  lotAllocations?: LotAllocationRawInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
 }
 
 export const ShipSalesOrderLineInputSchema: z.ZodType<
@@ -494,15 +506,22 @@ export const ShipSalesOrderLineInputSchema: z.ZodType<
   quantity: zQuantity.refine((val) => isPositive(val), {
     message: 'Ship quantity must be greater than zero',
   }),
+  lotAllocations: z.array(LotAllocationInputSchema).max(200).optional(),
+  confirmExpiredLotOverride: z.boolean().optional(),
+  overrideReason: z.string().trim().max(500).nullable().optional(),
 });
 
 export interface ShipSalesOrderInput {
   note?: string | null | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
   lines: ShipSalesOrderLineInput[];
 }
 
 export interface ShipSalesOrderRawInput {
   note?: string | null | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
   lines: ShipSalesOrderLineRawInput[];
 }
 
@@ -512,6 +531,8 @@ export const ShipSalesOrderInputSchema: z.ZodType<
   ShipSalesOrderRawInput
 > = z.object({
   note: z.string().trim().max(1000).nullable().optional(),
+  confirmExpiredLotOverride: z.boolean().optional(),
+  overrideReason: z.string().trim().max(500).nullable().optional(),
   lines: z.array(ShipSalesOrderLineInputSchema).min(1).max(500),
 });
 
