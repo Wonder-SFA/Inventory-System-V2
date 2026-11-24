@@ -4,10 +4,13 @@ import {
   CreateStockAdjustmentInputSchema,
   CreateStockIssueInputSchema,
   FefoPreviewQuerySchema,
+  ListLotBalancesQuerySchema,
   ListStockBalancesQuerySchema,
   ListStockLotBalancesQuerySchema,
+  ListStockLotsQuerySchema,
   ListStockMovementsQuerySchema,
   RecentReceiptCostsQuerySchema,
+  ValuationSummaryQuerySchema,
   uuidv7,
 } from '@iv2/shared-domain';
 import type { FastifyInstance } from 'fastify';
@@ -17,8 +20,11 @@ import { type OutboxDispatcher, executeCommand } from '../../../shared/index.js'
 import {
   assignOpeningLots,
   getRecentReceiptCosts,
+  getValuationSummary,
+  listLotBalances,
   listStockBalances,
   listStockLotBalances,
+  listStockLots,
   listStockMovements,
   previewFefoAllocation,
   recordManualAdjustment,
@@ -100,6 +106,84 @@ export function registerStockRoutes(
       const items = await listStockLotBalances(db, policy.locationScope, request.query);
       return {
         data: items.map((item) => policy.redactCosts(item)),
+        meta: {
+          requestId: request.id,
+        },
+      };
+    },
+  );
+
+  typedApp.get(
+    '/api/v1/stock-lots',
+    {
+      schema: {
+        querystring: ListStockLotsQuerySchema,
+      },
+    },
+    async (request) => {
+      const policy = request.accessPolicy!;
+      if (request.query.locationId) {
+        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
+      }
+      const query = request.query;
+      const result = await listStockLots(db, policy.locationScope, query);
+      return {
+        data: result.items.map((item) => policy.redactCosts(item)),
+        page: {
+          limit: query.limit,
+          nextCursor: result.nextCursor,
+          hasMore: result.hasMore,
+        },
+        meta: {
+          requestId: request.id,
+        },
+      };
+    },
+  );
+
+  typedApp.get(
+    '/api/v1/lot-balances',
+    {
+      schema: {
+        querystring: ListLotBalancesQuerySchema,
+      },
+    },
+    async (request) => {
+      const policy = request.accessPolicy!;
+      if (request.query.locationId) {
+        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
+      }
+      const query = request.query;
+      const result = await listLotBalances(db, policy.locationScope, query);
+      return {
+        data: result.items.map((item) => policy.redactCosts(item)),
+        page: {
+          limit: query.limit,
+          nextCursor: result.nextCursor,
+          hasMore: result.hasMore,
+        },
+        meta: {
+          requestId: request.id,
+        },
+      };
+    },
+  );
+
+  typedApp.get(
+    '/api/v1/valuation-summary',
+    {
+      schema: {
+        querystring: ValuationSummaryQuerySchema,
+      },
+    },
+    async (request) => {
+      const policy = request.accessPolicy!;
+      if (request.query.locationId) {
+        policy.assertCan('read', 'stock_balance', { locationId: request.query.locationId });
+      }
+      const summary = await getValuationSummary(db, policy.locationScope, request.query);
+      return {
+        data: policy.redactCosts(summary),
         meta: {
           requestId: request.id,
         },
