@@ -137,4 +137,147 @@ describe('AccessPolicy (in-process)', () => {
     expect('totalValue' in redacted).toBe(false);
     expect(JSON.stringify(redacted)).not.toContain('"0.0000"');
   });
+
+  it('redactCosts omits dual-costing FIFO and WAC fields recursively when canViewCosts is false', () => {
+    const policy = resolvePolicy(actor, { canViewCosts: false });
+    const dto = {
+      id: 'lot-1',
+      unitCost: '4.2500',
+      wacUnitCost: '4.1000',
+      fifoValue: '42.5000',
+      wacValue: '41.0000',
+      totalFifoValue: '42.5000',
+      totalWacValue: '41.0000',
+      dispatchUnitCost: '4.2500',
+      dispatchWacUnitCost: '4.1000',
+      suggestedUnitCost: '4.0000',
+      recentUnitCost: '4.2000',
+      nested: {
+        wacUnitCost: '4.1000',
+        keep: 'visible',
+      },
+      slices: [
+        {
+          lotId: 'lot-1',
+          quantityDelta: '-2.0000',
+          unitCost: '4.2500',
+          wacUnitCost: '4.1000',
+        },
+      ],
+    };
+
+    const redacted = policy.redactCosts(dto) as Record<string, unknown>;
+    expect(redacted).toEqual({
+      id: 'lot-1',
+      nested: {
+        keep: 'visible',
+      },
+      slices: [
+        {
+          lotId: 'lot-1',
+          quantityDelta: '-2.0000',
+        },
+      ],
+    });
+  });
+
+  describe('resolveLotPolicy cascade', () => {
+    it('defaults to AUTO_FEFO, allowExpiredLotOverride: false, negativeStockPolicy: FLEXIBLE_UNASSIGNED', () => {
+      const policy = resolvePolicy(actor);
+      expect(policy.resolveLotPolicy()).toEqual({
+        pickingMode: 'AUTO_FEFO',
+        allowExpiredLotOverride: false,
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+    });
+
+    it('resolves full USER -> ROLE -> LOCATION -> COMPANY precedence with field-level fallback', () => {
+      const staffActor = { ...actor, id: 'user-staff-1', role: 'STAFF' as const };
+      const policy = resolvePolicy(staffActor, {
+        lotPolicies: [
+          {
+            scopeType: 'COMPANY',
+            scopeId: '',
+            pickingMode: 'MANUAL_OPTIONAL',
+            allowExpiredLotOverride: false,
+            negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+          },
+          {
+            scopeType: 'LOCATION',
+            scopeId: 'loc-strict',
+            pickingMode: 'MANUAL_REQUIRED',
+            allowExpiredLotOverride: null,
+            negativeStockPolicy: 'STRICT_BLOCK',
+          },
+          {
+            scopeType: 'ROLE',
+            scopeId: 'STAFF',
+            pickingMode: null,
+            allowExpiredLotOverride: true,
+            negativeStockPolicy: null,
+          },
+          {
+            scopeType: 'USER',
+            scopeId: 'user-staff-1',
+            pickingMode: 'AUTO_FEFO',
+            allowExpiredLotOverride: null,
+            negativeStockPolicy: null,
+          },
+        ],
+      });
+
+      // At loc-strict:
+      // pickingMode: USER (AUTO_FEFO)
+      // allowExpiredLotOverride: USER is null -> ROLE (true)
+      // negativeStockPolicy: USER is null -> ROLE is null -> LOCATION (STRICT_BLOCK)
+      expect(policy.resolveLotPolicy({ locationId: 'loc-strict' })).toEqual({
+        pickingMode: 'AUTO_FEFO',
+        allowExpiredLotOverride: true,
+        negativeStockPolicy: 'STRICT_BLOCK',
+      });
+
+      // At loc-other (no LOCATION override):
+      // negativeStockPolicy falls back to COMPANY (FLEXIBLE_UNASSIGNED)
+      expect(policy.resolveLotPolicy({ locationId: 'loc-other' })).toEqual({
+        pickingMode: 'AUTO_FEFO',
+        allowExpiredLotOverride: true,
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+    });
+
+    it('lets ROLE override LOCATION when USER has no override', () => {
+      const managerActor = { ...actor, id: 'user-mgr-1', role: 'MANAGER' as const };
+      const policy = resolvePolicy(managerActor, {
+        lotPolicies: [
+          {
+            scopeType: 'COMPANY',
+            scopeId: '',
+            pickingMode: 'AUTO_FEFO',
+            allowExpiredLotOverride: false,
+            negativeStockPolicy: 'STRICT_BLOCK',
+          },
+          {
+            scopeType: 'LOCATION',
+            scopeId: 'loc-1',
+            pickingMode: 'MANUAL_REQUIRED',
+            allowExpiredLotOverride: false,
+            negativeStockPolicy: 'STRICT_BLOCK',
+          },
+          {
+            scopeType: 'ROLE',
+            scopeId: 'MANAGER',
+            pickingMode: 'MANUAL_OPTIONAL',
+            allowExpiredLotOverride: true,
+            negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+          },
+        ],
+      });
+
+      expect(policy.resolveLotPolicy({ locationId: 'loc-1' })).toEqual({
+        pickingMode: 'MANUAL_OPTIONAL',
+        allowExpiredLotOverride: true,
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+    });
+  });
 });

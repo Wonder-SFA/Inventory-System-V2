@@ -1,4 +1,12 @@
-import { ERROR_CODES, ForbiddenError } from '@iv2/shared-domain';
+import {
+  type ActorRole,
+  ERROR_CODES,
+  type EffectiveLotPolicy,
+  ForbiddenError,
+  type LotNegativeStockPolicy,
+  type LotPickingMode,
+  type LotPolicyScopeType,
+} from '@iv2/shared-domain';
 
 export type LocationScope =
   | { readonly allLocations: true }
@@ -8,6 +16,15 @@ export interface Actor {
   readonly id: string;
   readonly email: string;
   readonly name: string;
+  readonly role?: ActorRole | undefined;
+}
+
+export interface LotPolicyRule {
+  readonly scopeType: LotPolicyScopeType;
+  readonly scopeId: string;
+  readonly pickingMode: LotPickingMode | null;
+  readonly allowExpiredLotOverride: boolean | null;
+  readonly negativeStockPolicy: LotNegativeStockPolicy | null;
 }
 
 export interface AccessContext {
@@ -23,6 +40,7 @@ export interface AccessPolicy {
   readonly canViewCosts: boolean;
   assertCan(action: string, resource: string, context?: AccessContext): void;
   redactCosts<T>(dto: T): T;
+  resolveLotPolicy(context?: { readonly locationId?: string | undefined }): EffectiveLotPolicy;
 }
 
 export interface ResolvePolicyOverrides {
@@ -30,9 +48,29 @@ export interface ResolvePolicyOverrides {
   readonly canViewCosts?: boolean | undefined;
   readonly allowNegativeStock?: boolean | undefined;
   readonly deniedActions?: readonly string[] | undefined;
+  readonly lotPolicies?: readonly LotPolicyRule[] | undefined;
 }
 
-const REDACTED_COST_KEYS = new Set(['unitCost', 'weightedAverageCost', 'totalValue']);
+const REDACTED_COST_KEYS = new Set([
+  'unitCost',
+  'weightedAverageCost',
+  'totalValue',
+  'wacUnitCost',
+  'fifoValue',
+  'wacValue',
+  'totalFifoValue',
+  'totalWacValue',
+  'dispatchUnitCost',
+  'dispatchWacUnitCost',
+  'suggestedUnitCost',
+  'recentUnitCost',
+]);
+
+const DEFAULT_EFFECTIVE_LOT_POLICY: EffectiveLotPolicy = {
+  pickingMode: 'AUTO_FEFO',
+  allowExpiredLotOverride: false,
+  negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+};
 
 function stripCostKeys(value: unknown): unknown {
   if (value === null || value === undefined || typeof value !== 'object') {
@@ -71,6 +109,13 @@ export function resolvePolicy(actor: Actor, overrides?: ResolvePolicyOverrides):
   const canViewCosts = overrides?.canViewCosts ?? true;
   const allowNegativeStock = overrides?.allowNegativeStock ?? true;
   const deniedActions = new Set(overrides?.deniedActions ?? []);
+  const lotPolicies = overrides?.lotPolicies ?? [];
+  const actorRole: ActorRole = actor.role ?? 'OWNER';
+
+  const policyIndex = new Map<string, LotPolicyRule>();
+  for (const rule of lotPolicies) {
+    policyIndex.set(`${rule.scopeType}:${rule.scopeId}`, rule);
+  }
 
   return {
     actor,
@@ -103,6 +148,39 @@ export function resolvePolicy(actor: Actor, overrides?: ResolvePolicyOverrides):
         return dto;
       }
       return stripCostKeys(dto) as T;
+    },
+    resolveLotPolicy(context?: { readonly locationId?: string | undefined }): EffectiveLotPolicy {
+      const candidates: Array<LotPolicyRule | undefined> = [
+        policyIndex.get(`USER:${actor.id}`),
+        policyIndex.get(`ROLE:${actorRole}`),
+        context?.locationId ? policyIndex.get(`LOCATION:${context.locationId}`) : undefined,
+        policyIndex.get('COMPANY:'),
+      ];
+
+      let pickingMode: LotPickingMode | undefined;
+      let allowExpiredLotOverride: boolean | undefined;
+      let negativeStockPolicy: LotNegativeStockPolicy | undefined;
+
+      for (const rule of candidates) {
+        if (!rule) continue;
+        if (pickingMode === undefined && rule.pickingMode !== null) {
+          pickingMode = rule.pickingMode;
+        }
+        if (allowExpiredLotOverride === undefined && rule.allowExpiredLotOverride !== null) {
+          allowExpiredLotOverride = rule.allowExpiredLotOverride;
+        }
+        if (negativeStockPolicy === undefined && rule.negativeStockPolicy !== null) {
+          negativeStockPolicy = rule.negativeStockPolicy;
+        }
+      }
+
+      return {
+        pickingMode: pickingMode ?? DEFAULT_EFFECTIVE_LOT_POLICY.pickingMode,
+        allowExpiredLotOverride:
+          allowExpiredLotOverride ?? DEFAULT_EFFECTIVE_LOT_POLICY.allowExpiredLotOverride,
+        negativeStockPolicy:
+          negativeStockPolicy ?? DEFAULT_EFFECTIVE_LOT_POLICY.negativeStockPolicy,
+      };
     },
   };
 }

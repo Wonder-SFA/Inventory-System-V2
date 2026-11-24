@@ -1,9 +1,11 @@
 import { createDb, createPool, resetTestDatabase } from '@iv2/db';
 import { ERROR_CODES, uuidv7 } from '@iv2/shared-domain';
+import { eq } from 'drizzle-orm';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../../app.js';
 import { executeCommand } from '../../shared/command/index.js';
+import { iamUsers } from './db/index.js';
 import { setAccessSwitch } from './public/index.js';
 
 const testDbUrl = process.env.TEST_DATABASE_URL;
@@ -298,5 +300,243 @@ describe('iam auth, session, and Access Switch integration', () => {
     expect(signOutRes.statusCode).toBe(200);
 
     await app.close();
+  });
+
+  describe('Lot-picking & negative-stock policy configuration API', () => {
+    async function signUpUser(
+      app: ReturnType<typeof buildApp>,
+      db: ReturnType<typeof createDb>,
+      email: string,
+      name: string,
+      role: 'OWNER' | 'SUPER_ADMIN' | 'ADMIN' | 'MANAGER' | 'STAFF' | 'VIEWER',
+    ) {
+      const signUpRes = await app.inject({
+        method: 'POST',
+        url: '/api/auth/sign-up/email',
+        payload: { email, password: 'password1234', name },
+      });
+      expect(signUpRes.statusCode).toBe(200);
+      const userId = (signUpRes.json() as { user: { id: string } }).user.id;
+      await db.update(iamUsers).set({ role }).where(eq(iamUsers.id, userId));
+      return {
+        userId,
+        cookie: extractCookieHeader(signUpRes.headers['set-cookie']),
+      };
+    }
+
+    it('defaults effective lot policy and allows OWNER/SUPER_ADMIN to configure cascading policies with audit logs', async () => {
+      const { app, db } = createTestApp();
+      const owner = await signUpUser(app, db, 'owner@inventory.local', 'Owner User', 'OWNER');
+      const superAdmin = await signUpUser(
+        app,
+        db,
+        'super@inventory.local',
+        'Super Admin',
+        'SUPER_ADMIN',
+      );
+      const staff = await signUpUser(app, db, 'staff@inventory.local', 'Staff User', 'STAFF');
+      const locA = uuidv7();
+      const locB = uuidv7();
+
+      // Default effective policy
+      const defaultRes = await app.inject({
+        method: 'GET',
+        url: '/api/v1/iam/lot-policies/effective',
+        headers: { cookie: staff.cookie },
+      });
+      expect(defaultRes.statusCode).toBe(200);
+      expect(defaultRes.json().data).toEqual({
+        pickingMode: 'AUTO_FEFO',
+        allowExpiredLotOverride: false,
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+
+      // OWNER configures COMPANY default
+      const companyKey = uuidv7();
+      const companyRes = await app.inject({
+        method: 'PUT',
+        url: '/api/v1/iam/lot-policies',
+        headers: { cookie: owner.cookie, 'idempotency-key': companyKey },
+        payload: {
+          scopeType: 'COMPANY',
+          scopeId: '',
+          pickingMode: 'MANUAL_OPTIONAL',
+          allowExpiredLotOverride: false,
+          negativeStockPolicy: 'STRICT_BLOCK',
+        },
+      });
+      expect(companyRes.statusCode).toBe(200);
+      expect(companyRes.json().data).toMatchObject({
+        scopeType: 'COMPANY',
+        scopeId: '',
+        pickingMode: 'MANUAL_OPTIONAL',
+        allowExpiredLotOverride: false,
+        negativeStockPolicy: 'STRICT_BLOCK',
+      });
+
+      // Idempotent replay with same key does not create duplicate audit log
+      const replayRes = await app.inject({
+        method: 'PUT',
+        url: '/api/v1/iam/lot-policies',
+        headers: { cookie: owner.cookie, 'idempotency-key': companyKey },
+        payload: {
+          scopeType: 'COMPANY',
+          scopeId: '',
+          pickingMode: 'MANUAL_OPTIONAL',
+          allowExpiredLotOverride: false,
+          negativeStockPolicy: 'STRICT_BLOCK',
+        },
+      });
+      expect(replayRes.statusCode).toBe(200);
+
+      // SUPER_ADMIN configures LOCATION, ROLE, and USER overrides
+      const locRes = await app.inject({
+        method: 'PUT',
+        url: '/api/v1/iam/lot-policies',
+        headers: { cookie: superAdmin.cookie, 'idempotency-key': uuidv7() },
+        payload: {
+          scopeType: 'LOCATION',
+          scopeId: locA,
+          pickingMode: 'MANUAL_REQUIRED',
+          allowExpiredLotOverride: null,
+          negativeStockPolicy: null,
+        },
+      });
+      expect(locRes.statusCode).toBe(200);
+
+      const roleRes = await app.inject({
+        method: 'PUT',
+        url: '/api/v1/iam/lot-policies',
+        headers: { cookie: superAdmin.cookie, 'idempotency-key': uuidv7() },
+        payload: {
+          scopeType: 'ROLE',
+          scopeId: 'STAFF',
+          pickingMode: null,
+          allowExpiredLotOverride: true,
+          negativeStockPolicy: null,
+        },
+      });
+      expect(roleRes.statusCode).toBe(200);
+
+      // Update COMPANY policy to verify beforeState/afterState in audit log
+      const companyUpdateRes = await app.inject({
+        method: 'PUT',
+        url: '/api/v1/iam/lot-policies',
+        headers: { cookie: owner.cookie, 'idempotency-key': uuidv7() },
+        payload: {
+          scopeType: 'COMPANY',
+          scopeId: '',
+          pickingMode: 'AUTO_FEFO',
+          allowExpiredLotOverride: false,
+          negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+        },
+      });
+      expect(companyUpdateRes.statusCode).toBe(200);
+
+      // Staff effective policy at locA:
+      // pickingMode from LOCATION (MANUAL_REQUIRED)
+      // allowExpiredLotOverride from ROLE (true)
+      // negativeStockPolicy from COMPANY (FLEXIBLE_UNASSIGNED)
+      const staffLocARes = await app.inject({
+        method: 'GET',
+        url: `/api/v1/iam/lot-policies/effective?locationId=${locA}`,
+        headers: { cookie: staff.cookie },
+      });
+      expect(staffLocARes.statusCode).toBe(200);
+      expect(staffLocARes.json().data).toEqual({
+        pickingMode: 'MANUAL_REQUIRED',
+        allowExpiredLotOverride: true,
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+
+      // Staff effective policy at locB falls back to COMPANY for pickingMode
+      const staffLocBRes = await app.inject({
+        method: 'GET',
+        url: `/api/v1/iam/lot-policies/effective?locationId=${locB}`,
+        headers: { cookie: staff.cookie },
+      });
+      expect(staffLocBRes.statusCode).toBe(200);
+      expect(staffLocBRes.json().data).toEqual({
+        pickingMode: 'AUTO_FEFO',
+        allowExpiredLotOverride: true,
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+
+      // List all configured policies
+      const listRes = await app.inject({
+        method: 'GET',
+        url: '/api/v1/iam/lot-policies',
+        headers: { cookie: owner.cookie },
+      });
+      expect(listRes.statusCode).toBe(200);
+      expect(listRes.json().data).toHaveLength(3);
+
+      // Audit logs recorded 4 mutations (replay did not duplicate)
+      const auditRes = await app.inject({
+        method: 'GET',
+        url: '/api/v1/iam/audit-logs',
+        headers: { cookie: owner.cookie },
+      });
+      expect(auditRes.statusCode).toBe(200);
+      const logs = auditRes.json().data as Array<{
+        action: string;
+        resourceType: string;
+        resourceId: string;
+        beforeState: Record<string, unknown> | null;
+        afterState: Record<string, unknown> | null;
+      }>;
+      expect(logs).toHaveLength(4);
+      const latestCompanyLog = logs[0]!;
+      expect(latestCompanyLog.action).toBe('UPSERT_LOT_POLICY');
+      expect(latestCompanyLog.resourceType).toBe('lot_policy');
+      expect(latestCompanyLog.resourceId).toBe('COMPANY:');
+      expect(latestCompanyLog.beforeState).toMatchObject({
+        pickingMode: 'MANUAL_OPTIONAL',
+        negativeStockPolicy: 'STRICT_BLOCK',
+      });
+      expect(latestCompanyLog.afterState).toMatchObject({
+        pickingMode: 'AUTO_FEFO',
+        negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+      });
+
+      await app.close();
+    });
+
+    it('rejects lot policy mutations from unauthorized roles with 403 FORBIDDEN', async () => {
+      const { app, db } = createTestApp();
+      const admin = await signUpUser(app, db, 'admin-role@inventory.local', 'Admin User', 'ADMIN');
+      const manager = await signUpUser(
+        app,
+        db,
+        'manager-role@inventory.local',
+        'Manager User',
+        'MANAGER',
+      );
+      const staff = await signUpUser(app, db, 'staff-role@inventory.local', 'Staff User', 'STAFF');
+      const viewer = await signUpUser(
+        app,
+        db,
+        'viewer-role@inventory.local',
+        'Viewer User',
+        'VIEWER',
+      );
+
+      for (const user of [admin, manager, staff, viewer]) {
+        const res = await app.inject({
+          method: 'PUT',
+          url: '/api/v1/iam/lot-policies',
+          headers: { cookie: user.cookie, 'idempotency-key': uuidv7() },
+          payload: {
+            scopeType: 'COMPANY',
+            scopeId: '',
+            pickingMode: 'MANUAL_REQUIRED',
+          },
+        });
+        expect(res.statusCode).toBe(403);
+        expect(res.json().error.code).toBe(ERROR_CODES.FORBIDDEN);
+      }
+
+      await app.close();
+    });
   });
 });

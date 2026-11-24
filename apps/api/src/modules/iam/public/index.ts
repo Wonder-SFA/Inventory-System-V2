@@ -11,6 +11,7 @@ export {
   type AuthInstance,
   type CreateAuthOptions,
   type LocationScope,
+  type LotPolicyRule,
   type ResolvePolicyOverrides,
   createAuth,
   getAccessSwitch,

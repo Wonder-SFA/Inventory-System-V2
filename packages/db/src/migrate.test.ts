@@ -51,6 +51,7 @@ describe('database schema migrations', () => {
       '0009_orders_transfer_orders.sql',
       '0010_catalog_uom_status.sql',
       '0011_catalog_sku_lot_flags_and_stock_lots.sql',
+      '0012_iam_lot_policies_and_audit.sql',
     ]);
 
     const tables = await pool.query<{ table_name: string }>(
