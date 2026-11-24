@@ -7,7 +7,7 @@ import type {
   SupplierStatus,
   TransferOrderStatus,
 } from '@iv2/shared-domain';
-import { char, index, integer, numeric, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { char, date, index, integer, numeric, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 export const suppliers = ordersSchema.table(
   'suppliers',
@@ -194,3 +194,32 @@ export const transferOrderLines = ordersSchema.table(
 
 export type TransferOrderLineRow = typeof transferOrderLines.$inferSelect;
 export type NewTransferOrderLineRow = typeof transferOrderLines.$inferInsert;
+
+export const transferOrderLineLots = ordersSchema.table(
+  'transfer_order_line_lots',
+  {
+    id: uuid('id').primaryKey(),
+    transferOrderLineId: uuid('transfer_order_line_id')
+      .notNull()
+      .references(() => transferOrderLines.id, { onDelete: 'cascade' }),
+    lotId: uuid('lot_id'),
+    dispatchedQty: numeric('dispatched_qty', { precision: 18, scale: 4 }).notNull(),
+    receivedQty: numeric('received_qty', { precision: 18, scale: 4 }).notNull().default('0.0000'),
+    discrepancyQty: numeric('discrepancy_qty', { precision: 18, scale: 4 })
+      .notNull()
+      .default('0.0000'),
+    dispatchUnitCost: numeric('dispatch_unit_cost', { precision: 18, scale: 4 }).notNull(),
+    dispatchWacUnitCost: numeric('dispatch_wac_unit_cost', { precision: 18, scale: 4 }).notNull(),
+    currency: char('currency', { length: 3 }).notNull().default('USD'),
+    expDate: date('exp_date', { mode: 'string' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('orders_transfer_order_line_lots_line_idx').on(table.transferOrderLineId),
+    index('orders_transfer_order_line_lots_lot_idx').on(table.lotId),
+  ],
+);
+
+export type TransferOrderLineLotRow = typeof transferOrderLineLots.$inferSelect;
+export type NewTransferOrderLineLotRow = typeof transferOrderLineLots.$inferInsert;

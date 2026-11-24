@@ -4,12 +4,15 @@ import {
   type StockBalance,
   type StockMovement,
   type TransferOrder,
+  toQuantity,
+  toUnitCost,
   uuidv7,
 } from '@iv2/shared-domain';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../../app.js';
 import { OutboxDispatcher } from '../../shared/index.js';
+import { postMovements } from '../inventory/public/index.js';
 
 const testDbUrl = process.env.TEST_DATABASE_URL;
 
@@ -485,5 +488,428 @@ describe('orders: transfer order lifecycle integration', () => {
     await outboxDispatcher.drainOutbox();
     const eventTypes = emittedEvents.map((e) => e.eventType);
     expect(eventTypes).toContain('TransferDiscrepancyClosed');
+  });
+
+  it('supports multi-lot FEFO dispatch, exact dispatched cost preservation, partial & full multi-lot receipts with destination lot blending, and cost redaction', async () => {
+    const { app, cookie, skuId, locationAId, locationBId } = await setupFixture();
+
+    // Enable trackLots + trackExpiry on SKU
+    const skuGet = await app.inject({
+      method: 'GET',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie },
+    });
+    const skuVersion = (skuGet.json() as { data: { version: number } }).data.version;
+    const skuPatch = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { expectedVersion: skuVersion, trackLots: true, trackExpiry: true },
+    });
+    expect(skuPatch.statusCode).toBe(200);
+
+    const db = createDb(pool);
+
+    // Location B already holds 2 units of LOT-A @ 5.0000
+    // Location A holds 4 units of LOT-A @ 10.0000 and 6 units of LOT-B @ 20.0000 (WAC = 16.0000)
+    const { lotAId, lotBId } = await db.transaction(async (tx) => {
+      await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationBId,
+          lotInput: { lotCode: 'LOT-A', expDate: '2027-01-15' },
+          quantityDelta: toQuantity('2.0000'),
+          unitCost: toUnitCost('5.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      const srcRec = await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-A', expDate: '2027-01-15' },
+          quantityDelta: toQuantity('4.0000'),
+          unitCost: toUnitCost('10.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-B', expDate: '2027-06-30' },
+          quantityDelta: toQuantity('6.0000'),
+          unitCost: toUnitCost('20.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      return {
+        lotAId: srcRec.movements[0]!.lotId!,
+        lotBId: srcRec.movements[1]!.lotId!,
+      };
+    });
+
+    // Create & confirm Transfer Order for 7 units (Location A -> Location B)
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/transfer-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        sourceLocationId: locationAId,
+        destinationLocationId: locationBId,
+        lines: [{ skuId, orderedQty: '7.0000' }],
+      },
+    });
+    expect(createRes.statusCode).toBe(201);
+    const to = createRes.json().data as TransferOrder;
+    const lineId = to.lines[0]!.id;
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+
+    // Dispatch via AUTO_FEFO -> 4 LOT-A @ 10.0000 + 3 LOT-B @ 20.0000
+    const dispatchRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to.id}/dispatch`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(dispatchRes.statusCode).toBe(200);
+    const dispatchedTo = dispatchRes.json().data as TransferOrder;
+    const dispatchedLots = (dispatchedTo.lines[0] as unknown as {
+      lots?: Array<{
+        lotId: string | null;
+        lotCode?: string | null;
+        dispatchedQty: string;
+        receivedQty: string;
+        discrepancyQty: string;
+        dispatchUnitCost?: string;
+        dispatchWacUnitCost?: string;
+      }>;
+    }).lots;
+    expect(dispatchedLots).toHaveLength(2);
+    expect(dispatchedLots![0]!.lotId).toBe(lotAId);
+    expect(dispatchedLots![0]!.lotCode).toBe('LOT-A');
+    expect(dispatchedLots![0]!.dispatchedQty).toBe('4.0000');
+    expect(dispatchedLots![0]!.dispatchUnitCost).toBe('10.0000');
+    expect(dispatchedLots![0]!.dispatchWacUnitCost).toBe('16.0000');
+    expect(dispatchedLots![1]!.lotId).toBe(lotBId);
+    expect(dispatchedLots![1]!.lotCode).toBe('LOT-B');
+    expect(dispatchedLots![1]!.dispatchedQty).toBe('3.0000');
+    expect(dispatchedLots![1]!.dispatchUnitCost).toBe('20.0000');
+    expect(dispatchedLots![1]!.dispatchWacUnitCost).toBe('16.0000');
+
+    // Change Location A's LOT-B cost while in transit by receiving 3 more LOT-B @ 50.0000
+    await db.transaction(async (tx) => {
+      await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-B', expDate: '2027-06-30' },
+          quantityDelta: toQuantity('3.0000'),
+          unitCost: toUnitCost('50.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+    });
+
+    // Partial receipt 1: receive 4 LOT-A + 1 LOT-B
+    const rec1Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: lineId,
+            quantity: '5.0000',
+            lotAllocations: [
+              { lotId: lotAId, quantity: '4.0000' },
+              { lotId: lotBId, quantity: '1.0000' },
+            ],
+          },
+        ],
+      },
+    });
+    expect(rec1Res.statusCode).toBe(201);
+    expect(rec1Res.json().data.status).toBe('PARTIALLY_RECEIVED');
+
+    // Partial receipt 2: receive remaining 2 LOT-B (omitting lotAllocations -> auto-allocates remaining in-transit)
+    const rec2Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: lineId, quantity: '2.0000' }],
+      },
+    });
+    expect(rec2Res.statusCode).toBe(201);
+    expect(rec2Res.json().data.status).toBe('RECEIVED');
+
+    // Verify Location B lot balances: LOT-A blended (2*5 + 4*10)/6 = 8.3333, LOT-B = 20.0000 (not 35.0000!)
+    const { rows: dstLots } = await pool.query<{
+      lot_code: string;
+      on_hand: string;
+      in_transit: string;
+      unit_cost: string;
+    }>(
+      `SELECT l.lot_code, b.on_hand, b.in_transit, b.unit_cost
+       FROM inventory.stock_lot_balances b
+       JOIN inventory.stock_lots l ON l.id = b.lot_id
+       WHERE l.sku_id = $1 AND b.location_id = $2
+       ORDER BY l.lot_code ASC`,
+      [skuId, locationBId],
+    );
+    expect(dstLots.find((r) => r.lot_code === 'LOT-A')).toEqual({
+      lot_code: 'LOT-A',
+      on_hand: '6.0000',
+      in_transit: '0.0000',
+      unit_cost: '8.3333',
+    });
+    expect(dstLots.find((r) => r.lot_code === 'LOT-B')).toEqual({
+      lot_code: 'LOT-B',
+      on_hand: '3.0000',
+      in_transit: '0.0000',
+      unit_cost: '20.0000',
+    });
+  });
+
+  it('closes short-received multi-lot Transfer Order discrepancies defaulting to latest-expiring lot or using explicit per-lot attribution', async () => {
+    const { app, cookie, skuId, locationAId, locationBId } = await setupFixture();
+
+    const skuGet = await app.inject({
+      method: 'GET',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie },
+    });
+    const skuVersion = (skuGet.json() as { data: { version: number } }).data.version;
+    await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { expectedVersion: skuVersion, trackLots: true, trackExpiry: true },
+    });
+
+    const db = createDb(pool);
+    const { earlyLotId, lateLotId } = await db.transaction(async (tx) => {
+      const rec = await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-EARLY', expDate: '2027-02-01' },
+          quantityDelta: toQuantity('5.0000'),
+          unitCost: toUnitCost('10.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-LATE', expDate: '2027-09-01' },
+          quantityDelta: toQuantity('5.0000'),
+          unitCost: toUnitCost('12.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      return {
+        earlyLotId: rec.movements[0]!.lotId!,
+        lateLotId: rec.movements[1]!.lotId!,
+      };
+    });
+
+    // TO 1: 5 LOT-EARLY + 3 LOT-LATE = 8; receive 4 total (auto FEFO -> 4 LOT-EARLY), close discrepancy unspecified -> attributes 3 to LOT-LATE first, then 1 to LOT-EARLY
+    const to1Res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/transfer-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        sourceLocationId: locationAId,
+        destinationLocationId: locationBId,
+        lines: [{ skuId, orderedQty: '8.0000' }],
+      },
+    });
+    const to1 = to1Res.json().data as TransferOrder;
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to1.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to1.id}/dispatch`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to1.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { lines: [{ orderLineId: to1.lines[0]!.id, quantity: '4.0000' }] },
+    });
+    const close1Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to1.id}/close-discrepancy`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { reason: 'DAMAGED', note: '4 units damaged in transit' },
+    });
+    expect(close1Res.statusCode).toBe(200);
+    const closed1 = close1Res.json().data as TransferOrder & {
+      lines: Array<{
+        lots?: Array<{ lotId: string | null; discrepancyQty: string }>;
+      }>;
+    };
+    const earlyLineLot1 = closed1.lines[0]!.lots!.find((l) => l.lotId === earlyLotId);
+    const lateLineLot1 = closed1.lines[0]!.lots!.find((l) => l.lotId === lateLotId);
+    expect(earlyLineLot1?.discrepancyQty).toBe('1.0000');
+    expect(lateLineLot1?.discrepancyQty).toBe('3.0000');
+
+    // TO 2: 0 LOT-EARLY + 2 LOT-LATE = 2; receive 0; close discrepancy explicitly attributing 2 to LOT-LATE
+    const to2Res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/transfer-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        sourceLocationId: locationAId,
+        destinationLocationId: locationBId,
+        lines: [{ skuId, orderedQty: '2.0000' }],
+      },
+    });
+    const to2 = to2Res.json().data as TransferOrder;
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to2.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to2.id}/dispatch`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    const close2Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to2.id}/close-discrepancy`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        reason: 'LOST',
+        note: '1 early + 1 late lost',
+        lines: [
+          {
+            orderLineId: to2.lines[0]!.id,
+            lotAllocations: [{ lotId: lateLotId, quantity: '2.0000' }],
+          },
+        ],
+      },
+    });
+    expect(close2Res.statusCode).toBe(200);
+    const closed2 = close2Res.json().data as TransferOrder & {
+      lines: Array<{
+        lots?: Array<{ lotId: string | null; discrepancyQty: string }>;
+      }>;
+    };
+    expect(closed2.lines[0]!.lots!.find((l) => l.lotId === lateLotId)?.discrepancyQty).toBe(
+      '2.0000',
+    );
+
+    // All in_transit cleared at Location B
+    const { rows: dstBals } = await pool.query<{ in_transit: string }>(
+      `SELECT in_transit FROM inventory.stock_lot_balances WHERE location_id = $1`,
+      [locationBId],
+    );
+    for (const row of dstBals) {
+      expect(row.in_transit).toBe('0.0000');
+    }
+  });
+
+  it('supports manual lotAllocations on Transfer Order dispatch when policy permits', async () => {
+    const { app, cookie, skuId, locationAId, locationBId } = await setupFixture();
+
+    const skuGet = await app.inject({
+      method: 'GET',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie },
+    });
+    const skuVersion = (skuGet.json() as { data: { version: number } }).data.version;
+    await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${skuId}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { expectedVersion: skuVersion, trackLots: true, trackExpiry: true },
+    });
+
+    const db = createDb(pool);
+    const { lateLotId } = await db.transaction(async (tx) => {
+      const rec = await postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-E', expDate: '2027-02-01' },
+          quantityDelta: toQuantity('5.0000'),
+          unitCost: toUnitCost('10.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId: locationAId,
+          lotInput: { lotCode: 'LOT-L', expDate: '2027-09-01' },
+          quantityDelta: toQuantity('5.0000'),
+          unitCost: toUnitCost('15.0000'),
+          actorId: 'test-actor',
+          idempotencyKey: uuidv7(),
+        },
+      ]);
+      return { lateLotId: rec.movements[1]!.lotId! };
+    });
+
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/transfer-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        sourceLocationId: locationAId,
+        destinationLocationId: locationBId,
+        lines: [{ skuId, orderedQty: '3.0000' }],
+      },
+    });
+    const to = createRes.json().data as TransferOrder;
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+
+    // Manually pick LOT-L instead of FEFO LOT-E
+    const dispatchRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/transfer-orders/${to.id}/dispatch`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: to.lines[0]!.id,
+            lotAllocations: [{ lotId: lateLotId, quantity: '3.0000' }],
+          },
+        ],
+      },
+    });
+    expect(dispatchRes.statusCode).toBe(200);
+    const dispatched = dispatchRes.json().data as TransferOrder;
+    expect(dispatched.lines[0]!.lots).toHaveLength(1);
+    expect(dispatched.lines[0]!.lots![0]!.lotId).toBe(lateLotId);
+    expect(dispatched.lines[0]!.lots![0]!.dispatchedQty).toBe('3.0000');
+    expect(dispatched.lines[0]!.lots![0]!.dispatchUnitCost).toBe('15.0000');
   });
 });
