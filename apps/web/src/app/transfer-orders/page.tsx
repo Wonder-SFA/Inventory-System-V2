@@ -21,6 +21,18 @@ interface DraftLineState {
   orderedQty: string;
 }
 
+interface ReceiveLotState {
+  lotId: string | null;
+  lotCode: string;
+  expDate: string | null;
+  dispatchedQty: string;
+  receivedQty: string;
+  discrepancyQty: string;
+  dispatchUnitCost?: string | undefined;
+  currency: string;
+  quantity: string;
+}
+
 interface ReceiveLineState {
   orderLineId: string;
   skuLabel: string;
@@ -29,6 +41,22 @@ interface ReceiveLineState {
   dispatchUnitCost: string | null;
   currency: string;
   quantity: string;
+  lots: ReceiveLotState[];
+}
+
+interface DiscrepancyLotState {
+  lotId: string | null;
+  lotCode: string;
+  expDate: string | null;
+  openQty: string;
+  quantity: string;
+}
+
+interface DiscrepancyLineState {
+  orderLineId: string;
+  skuLabel: string;
+  remainingQty: string;
+  lots: DiscrepancyLotState[];
 }
 
 const STATUS_FILTERS: readonly StatusFilter[] = [
@@ -78,6 +106,7 @@ export default function TransferOrdersPage() {
   const [closingOrder, setClosingOrder] = useState<TransferOrder | null>(null);
   const [discrepancyReason, setDiscrepancyReason] = useState<DiscrepancyReason>('LOST');
   const [discrepancyNote, setDiscrepancyNote] = useState('');
+  const [discrepancyLines, setDiscrepancyLines] = useState<DiscrepancyLineState[]>([]);
   const [closingDiscrepancy, setClosingDiscrepancy] = useState(false);
 
   const loadReferenceData = useCallback(async () => {
@@ -270,6 +299,23 @@ export default function TransferOrdersPage() {
     setReceiveLines(
       to.lines.map((line) => {
         const remaining = Math.max(0, Number(line.dispatchedQty) - Number(line.receivedQty));
+        const lots: ReceiveLotState[] = (line.lots ?? []).map((lot) => {
+          const lotOpen = Math.max(
+            0,
+            Number(lot.dispatchedQty) - Number(lot.receivedQty) - Number(lot.discrepancyQty),
+          );
+          return {
+            lotId: lot.lotId,
+            lotCode: lot.lotCode ?? (lot.lotId ? lot.lotId : 'Unlotted'),
+            expDate: lot.expDate,
+            dispatchedQty: lot.dispatchedQty,
+            receivedQty: lot.receivedQty,
+            discrepancyQty: lot.discrepancyQty,
+            dispatchUnitCost: lot.dispatchUnitCost,
+            currency: lot.currency,
+            quantity: lotOpen > 0 ? lotOpen.toFixed(4) : '0.0000',
+          };
+        });
         return {
           orderLineId: line.id,
           skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName}` : line.skuId,
@@ -278,6 +324,7 @@ export default function TransferOrdersPage() {
           dispatchUnitCost: line.dispatchUnitCost ?? null,
           currency: line.currency,
           quantity: remaining > 0 ? remaining.toFixed(4) : '0.0000',
+          lots,
         };
       }),
     );
@@ -291,8 +338,21 @@ export default function TransferOrdersPage() {
     }
 
     const linesToReceive = receiveLines
-      .filter((l) => Number(l.quantity) > 0)
-      .map((l) => ({ orderLineId: l.orderLineId, quantity: l.quantity }));
+      .map((l) => {
+        if (l.lots.length > 0) {
+          const lotAllocs = l.lots
+            .filter((lot) => Number(lot.quantity) > 0)
+            .map((lot) => ({ lotId: lot.lotId, quantity: lot.quantity }));
+          const sum = lotAllocs.reduce((acc, a) => acc + Number(a.quantity), 0);
+          return {
+            orderLineId: l.orderLineId,
+            quantity: sum.toFixed(4),
+            lotAllocations: lotAllocs,
+          };
+        }
+        return { orderLineId: l.orderLineId, quantity: l.quantity };
+      })
+      .filter((l) => Number(l.quantity) > 0);
 
     if (linesToReceive.length === 0) {
       setError('Enter a positive quantity on at least one line to receive.');
@@ -329,6 +389,49 @@ export default function TransferOrdersPage() {
     setClosingOrder(to);
     setDiscrepancyReason('LOST');
     setDiscrepancyNote('');
+    const dLines: DiscrepancyLineState[] = [];
+    for (const line of to.lines) {
+      const remaining = Math.max(0, Number(line.dispatchedQty) - Number(line.receivedQty));
+      if (remaining <= 0) continue;
+      const openLots = (line.lots ?? [])
+        .map((lot) => ({
+          lotId: lot.lotId,
+          lotCode: lot.lotCode ?? (lot.lotId ? lot.lotId : 'Unlotted'),
+          expDate: lot.expDate,
+          openQty: Math.max(
+            0,
+            Number(lot.dispatchedQty) - Number(lot.receivedQty) - Number(lot.discrepancyQty),
+          ),
+        }))
+        .filter((l) => l.openQty > 0)
+        .sort((a, b) => {
+          if (a.expDate && b.expDate) return b.expDate.localeCompare(a.expDate);
+          if (a.expDate && !b.expDate) return -1;
+          if (!a.expDate && b.expDate) return 1;
+          return 0;
+        });
+
+      let toAttr = remaining;
+      const lots: DiscrepancyLotState[] = openLots.map((l) => {
+        const take = Math.min(toAttr, l.openQty);
+        toAttr = Math.max(0, toAttr - take);
+        return {
+          lotId: l.lotId,
+          lotCode: l.lotCode,
+          expDate: l.expDate,
+          openQty: l.openQty.toFixed(4),
+          quantity: take.toFixed(4),
+        };
+      });
+
+      dLines.push({
+        orderLineId: line.id,
+        skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName}` : line.skuId,
+        remainingQty: remaining.toFixed(4),
+        lots,
+      });
+    }
+    setDiscrepancyLines(dLines);
     setError(null);
   }
 
@@ -337,6 +440,15 @@ export default function TransferOrdersPage() {
     if (!closingOrder) {
       return;
     }
+
+    const linesPayload = discrepancyLines
+      .filter((dl) => dl.lots.length > 0)
+      .map((dl) => ({
+        orderLineId: dl.orderLineId,
+        lotAllocations: dl.lots
+          .filter((l) => Number(l.quantity) > 0)
+          .map((l) => ({ lotId: l.lotId, quantity: l.quantity })),
+      }));
 
     setError(null);
     setWarnings([]);
@@ -349,6 +461,7 @@ export default function TransferOrdersPage() {
           body: JSON.stringify({
             reason: discrepancyReason,
             note: discrepancyNote.trim(),
+            ...(linesPayload.length > 0 ? { lines: linesPayload } : {}),
           }),
         },
       );
@@ -585,35 +698,85 @@ export default function TransferOrdersPage() {
                   <div
                     key={line.orderLineId}
                     style={{
-                      display: 'grid',
-                      gridTemplateColumns: '2fr 1fr',
-                      gap: 10,
-                      alignItems: 'center',
                       padding: '8px 0',
                       borderBottom: '1px solid var(--border)',
                     }}
                   >
-                    <div>
-                      <div style={{ fontWeight: 500, fontSize: 13 }}>{line.skuLabel}</div>
-                      <div style={{ fontSize: 12, color: 'var(--muted)' }}>
-                        Dispatched: {line.dispatchedQty} | Received: {line.receivedQty}
-                        {line.dispatchUnitCost
-                          ? ` | Snapshot Cost: ${line.dispatchUnitCost} ${line.currency}`
-                          : ''}
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: line.lots.length > 0 ? '1fr' : '2fr 1fr',
+                        gap: 10,
+                        alignItems: 'center',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 500, fontSize: 13 }}>{line.skuLabel}</div>
+                        <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                          Dispatched: {line.dispatchedQty} | Received: {line.receivedQty}
+                          {line.dispatchUnitCost
+                            ? ` | Snapshot Cost: ${line.dispatchUnitCost} ${line.currency}`
+                            : ''}
+                        </div>
                       </div>
+                      {line.lots.length === 0 && (
+                        <input
+                          className="form-input"
+                          aria-label={`Receive quantity for ${line.skuLabel}`}
+                          value={line.quantity}
+                          onChange={(e) =>
+                            setReceiveLines((prev) =>
+                              prev.map((item, i) =>
+                                i === index ? { ...item, quantity: e.target.value } : item,
+                              ),
+                            )
+                          }
+                        />
+                      )}
                     </div>
-                    <input
-                      className="form-input"
-                      aria-label={`Receive quantity for ${line.skuLabel}`}
-                      value={line.quantity}
-                      onChange={(e) =>
-                        setReceiveLines((prev) =>
-                          prev.map((item, i) =>
-                            i === index ? { ...item, quantity: e.target.value } : item,
-                          ),
-                        )
-                      }
-                    />
+                    {line.lots.length > 0 && (
+                      <div style={{ marginTop: 8, paddingLeft: 12, display: 'grid', gap: 6 }}>
+                        {line.lots.map((lot, lotIdx) => (
+                          <div
+                            key={`${line.orderLineId}-${lot.lotId ?? 'unlotted'}-${lotIdx}`}
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '2fr 1fr',
+                              gap: 8,
+                              alignItems: 'center',
+                            }}
+                          >
+                            <div style={{ fontSize: 12 }}>
+                              <strong>{lot.lotCode}</strong>
+                              {lot.expDate ? ` (exp ${lot.expDate})` : ''} — disp {lot.dispatchedQty} /
+                              rec {lot.receivedQty}
+                              {lot.dispatchUnitCost
+                                ? ` @ ${lot.dispatchUnitCost} ${lot.currency}`
+                                : ''}
+                            </div>
+                            <input
+                              className="form-input"
+                              aria-label={`Receive quantity for lot ${lot.lotCode}`}
+                              value={lot.quantity}
+                              onChange={(e) =>
+                                setReceiveLines((prev) =>
+                                  prev.map((item, i) =>
+                                    i === index
+                                      ? {
+                                          ...item,
+                                          lots: item.lots.map((l, li) =>
+                                            li === lotIdx ? { ...l, quantity: e.target.value } : l,
+                                          ),
+                                        }
+                                      : item,
+                                  ),
+                                )
+                              }
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 ))}
 
@@ -671,6 +834,70 @@ export default function TransferOrdersPage() {
                     required
                   />
                 </div>
+
+                {discrepancyLines.some((dl) => dl.lots.length > 0) && (
+                  <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                    <div className="form-label" style={{ marginBottom: 0 }}>
+                      Short-Lot Attribution (defaults to latest-expiring lot)
+                    </div>
+                    {discrepancyLines
+                      .filter((dl) => dl.lots.length > 0)
+                      .map((dl, dlIdx) => (
+                        <div
+                          key={dl.orderLineId}
+                          style={{
+                            padding: 8,
+                            border: '1px solid var(--border)',
+                            borderRadius: 6,
+                          }}
+                        >
+                          <div style={{ fontWeight: 500, fontSize: 12, marginBottom: 6 }}>
+                            {dl.skuLabel} — Short Remainder: {dl.remainingQty}
+                          </div>
+                          <div style={{ display: 'grid', gap: 6 }}>
+                            {dl.lots.map((lot, lotIdx) => (
+                              <div
+                                key={`${dl.orderLineId}-${lot.lotId ?? 'unlotted'}-${lotIdx}`}
+                                style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: '2fr 1fr',
+                                  gap: 8,
+                                  alignItems: 'center',
+                                }}
+                              >
+                                <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                                  <strong>{lot.lotCode}</strong>
+                                  {lot.expDate ? ` (exp ${lot.expDate})` : ''} — In-Transit:{' '}
+                                  {lot.openQty}
+                                </div>
+                                <input
+                                  className="form-input"
+                                  aria-label={`Short quantity for lot ${lot.lotCode}`}
+                                  value={lot.quantity}
+                                  onChange={(e) =>
+                                    setDiscrepancyLines((prev) =>
+                                      prev.map((item, i) =>
+                                        i === dlIdx
+                                          ? {
+                                              ...item,
+                                              lots: item.lots.map((l, li) =>
+                                                li === lotIdx
+                                                  ? { ...l, quantity: e.target.value }
+                                                  : l,
+                                              ),
+                                            }
+                                          : item,
+                                      ),
+                                    )
+                                  }
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
 
                 <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
                   <button
@@ -763,12 +990,31 @@ export default function TransferOrdersPage() {
                         <td>
                           <div style={{ fontSize: 12 }}>
                             {to.lines.map((line) => (
-                              <div key={line.id}>
-                                {line.skuCode ?? line.skuId}: ord {line.orderedQty} / disp{' '}
-                                {line.dispatchedQty} / rec {line.receivedQty}
-                                {line.dispatchUnitCost
-                                  ? ` @ ${line.dispatchUnitCost} ${line.currency}`
-                                  : ''}
+                              <div key={line.id} style={{ marginBottom: 4 }}>
+                                <div>
+                                  {line.skuCode ?? line.skuId}: ord {line.orderedQty} / disp{' '}
+                                  {line.dispatchedQty} / rec {line.receivedQty}
+                                  {line.dispatchUnitCost
+                                    ? ` @ ${line.dispatchUnitCost} ${line.currency}`
+                                    : ''}
+                                </div>
+                                {line.lots && line.lots.length > 0 && (
+                                  <div style={{ paddingLeft: 10, fontSize: 11, color: 'var(--muted)' }}>
+                                    {line.lots.map((lot) => (
+                                      <div key={lot.id}>
+                                        &bull; {lot.lotCode ?? (lot.lotId ? lot.lotId : 'Unlotted')}
+                                        {lot.expDate ? ` (exp ${lot.expDate})` : ''}: disp{' '}
+                                        {lot.dispatchedQty} / rec {lot.receivedQty}
+                                        {Number(lot.discrepancyQty) > 0
+                                          ? ` / short ${lot.discrepancyQty}`
+                                          : ''}
+                                        {lot.dispatchUnitCost
+                                          ? ` @ ${lot.dispatchUnitCost} ${lot.currency}`
+                                          : ''}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                             ))}
                           </div>

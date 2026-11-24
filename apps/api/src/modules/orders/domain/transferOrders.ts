@@ -13,6 +13,7 @@ import {
   type ReceiveTransferOrderResult,
   type TransferOrder,
   type TransferOrderLine,
+  type TransferOrderLineLot,
   type UUID,
   type UpdateTransferOrderInput,
   ValidationError,
@@ -21,6 +22,8 @@ import {
   gt,
   gte,
   isPositive,
+  isZero,
+  lt,
   sub,
   toQuantity,
   toUnitCost,
@@ -42,11 +45,14 @@ import {
   dispatchTransfer,
   getLocationById,
   getLocationsByIds,
+  getStockLotsByIds,
   receiveTransfer,
 } from '../../inventory/public/index.js';
 import {
+  type TransferOrderLineLotRow,
   type TransferOrderLineRow,
   type TransferOrderRow,
+  transferOrderLineLots,
   transferOrderLines,
   transferOrders,
 } from '../db/index.js';
@@ -75,9 +81,31 @@ function buildLocationScopeFilter(scope: LocationScope): {
   return { empty: true };
 }
 
+function toTransferOrderLineLotDto(
+  row: TransferOrderLineLotRow,
+  lotCode: string | null,
+): TransferOrderLineLot {
+  return {
+    id: row.id,
+    transferOrderLineId: row.transferOrderLineId,
+    lotId: row.lotId ?? null,
+    lotCode,
+    dispatchedQty: toQuantity(row.dispatchedQty),
+    receivedQty: toQuantity(row.receivedQty),
+    discrepancyQty: toQuantity(row.discrepancyQty),
+    dispatchUnitCost: toUnitCost(row.dispatchUnitCost),
+    dispatchWacUnitCost: toUnitCost(row.dispatchWacUnitCost),
+    currency: row.currency,
+    expDate: row.expDate ?? null,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
 function toTransferOrderLineDto(
   row: TransferOrderLineRow,
   skuMeta?: { code: string; name: string },
+  lots?: TransferOrderLineLot[],
 ): TransferOrderLine {
   return {
     id: row.id,
@@ -89,6 +117,7 @@ function toTransferOrderLineDto(
     receivedQty: toQuantity(row.receivedQty),
     dispatchUnitCost: row.dispatchUnitCost !== null ? toUnitCost(row.dispatchUnitCost) : null,
     currency: row.currency,
+    lots: lots ?? [],
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -117,7 +146,34 @@ async function enrichTransferOrders(
   ]);
 
   const skuIds = [...new Set(lineRows.map((l) => l.skuId))];
-  const skuDtos = await getSkusByIds(db, skuIds);
+  const lineIds = lineRows.map((l) => l.id);
+
+  const [skuDtos, lineLotRows] = await Promise.all([
+    getSkusByIds(db, skuIds),
+    lineIds.length > 0
+      ? db
+          .select()
+          .from(transferOrderLineLots)
+          .where(inArray(transferOrderLineLots.transferOrderLineId, lineIds))
+          .orderBy(
+            asc(transferOrderLineLots.expDate),
+            asc(transferOrderLineLots.createdAt),
+            asc(transferOrderLineLots.id),
+          )
+      : Promise.resolve([]),
+  ]);
+
+  const lotIds = lineLotRows.map((l) => l.lotId).filter((id): id is string => id !== null);
+  const stockLotDtos = lotIds.length > 0 ? await getStockLotsByIds(db, lotIds) : [];
+  const lotCodeMap = new Map(stockLotDtos.map((l) => [l.id, l.lotCode]));
+
+  const lotsByLineId = new Map<string, TransferOrderLineLot[]>();
+  for (const lotRow of lineLotRows) {
+    const list = lotsByLineId.get(lotRow.transferOrderLineId) ?? [];
+    const lotCode = lotRow.lotId ? (lotCodeMap.get(lotRow.lotId) ?? null) : null;
+    list.push(toTransferOrderLineLotDto(lotRow, lotCode));
+    lotsByLineId.set(lotRow.transferOrderLineId, list);
+  }
 
   const locationMap = new Map(locationDtos.map((l) => [l.id, l.name]));
   const skuMap = new Map(skuDtos.map((s) => [s.id, { code: s.code, name: s.name }]));
@@ -125,7 +181,9 @@ async function enrichTransferOrders(
   const linesByToId = new Map<string, TransferOrderLine[]>();
   for (const lineRow of lineRows) {
     const list = linesByToId.get(lineRow.transferOrderId) ?? [];
-    list.push(toTransferOrderLineDto(lineRow, skuMap.get(lineRow.skuId)));
+    list.push(
+      toTransferOrderLineDto(lineRow, skuMap.get(lineRow.skuId), lotsByLineId.get(lineRow.id)),
+    );
     linesByToId.set(lineRow.transferOrderId, list);
   }
 
@@ -482,6 +540,12 @@ export async function dispatchTransferOrder(
     actorId: string;
     deriveLineIdempotencyKey: (lineId: string) => UUID;
     emit?: OrderEmitEventFn;
+    resolveLotPolicy?: (locationId: string) => {
+      pickingMode: 'AUTO_FEFO' | 'MANUAL_REQUIRED' | 'MANUAL_OPTIONAL';
+      allowExpiredLotOverride?: boolean;
+      negativeStockPolicy: 'FLEXIBLE_UNASSIGNED' | 'STRICT_BLOCK';
+    };
+    canManualFefoOverride?: (locationId: string) => boolean;
   },
 ): Promise<{ order: TransferOrder; warnings: ApiWarning[] }> {
   const [existing] = await tx
@@ -512,21 +576,41 @@ export async function dispatchTransferOrder(
     .orderBy(asc(transferOrderLines.createdAt), asc(transferOrderLines.id))
     .for('update');
 
-  const dispatchLines: DispatchTransferLine[] = lineRows.map((line) => ({
-    skuId: line.skuId,
-    sourceLocationId: existing.sourceLocationId,
-    destinationLocationId: existing.destinationLocationId,
-    quantity: toQuantity(line.orderedQty),
-    referenceType: 'TRANSFER_ORDER',
-    referenceId: existing.id,
-    actorId: options.actorId,
-    idempotencyKey: options.deriveLineIdempotencyKey(line.id),
-    note: input?.note ?? null,
-  }));
+  const inputLineById = new Map((input?.lines ?? []).map((l) => [l.orderLineId, l]));
+  const lotPolicy = options.resolveLotPolicy
+    ? options.resolveLotPolicy(existing.sourceLocationId)
+    : undefined;
+  const allowManualFefoOverride = options.canManualFefoOverride
+    ? options.canManualFefoOverride(existing.sourceLocationId)
+    : true;
+
+  const dispatchLines: DispatchTransferLine[] = lineRows.map((line) => {
+    const reqLine = inputLineById.get(line.id);
+    return {
+      skuId: line.skuId,
+      sourceLocationId: existing.sourceLocationId,
+      destinationLocationId: existing.destinationLocationId,
+      quantity: toQuantity(line.orderedQty),
+      lotAllocations: reqLine?.lotAllocations,
+      pickingMode: lotPolicy?.pickingMode,
+      negativeStockPolicy: lotPolicy?.negativeStockPolicy,
+      allowManualFefoOverride,
+      allowExpiredLotOverride: lotPolicy?.allowExpiredLotOverride ?? false,
+      confirmExpiredLotOverride:
+        reqLine?.confirmExpiredLotOverride ?? input?.confirmExpiredLotOverride ?? false,
+      overrideReason: reqLine?.overrideReason ?? input?.overrideReason ?? null,
+      referenceType: 'TRANSFER_ORDER',
+      referenceId: existing.id,
+      actorId: options.actorId,
+      idempotencyKey: options.deriveLineIdempotencyKey(line.id),
+      note: input?.note ?? null,
+    };
+  });
 
   const dispatched = await dispatchTransfer(tx, dispatchLines, { emit: options.emit });
 
   const now = new Date();
+  const lineLotInserts: Array<typeof transferOrderLineLots.$inferInsert> = [];
   for (let i = 0; i < lineRows.length; i++) {
     const lineRow = lineRows[i]!;
     const dispLine = dispatched.dispatchedLines[i]!;
@@ -539,6 +623,27 @@ export async function dispatchTransferOrder(
         updatedAt: now,
       })
       .where(eq(transferOrderLines.id, lineRow.id));
+
+    for (const lot of dispLine.lots) {
+      lineLotInserts.push({
+        id: uuidv7(),
+        transferOrderLineId: lineRow.id,
+        lotId: lot.lotId,
+        dispatchedQty: lot.quantity,
+        receivedQty: ZERO_DECIMAL4,
+        discrepancyQty: ZERO_DECIMAL4,
+        dispatchUnitCost: lot.dispatchUnitCost,
+        dispatchWacUnitCost: lot.dispatchWacUnitCost,
+        currency: lot.currency,
+        expDate: lot.expDate,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  }
+
+  if (lineLotInserts.length > 0) {
+    await tx.insert(transferOrderLineLots).values(lineLotInserts);
   }
 
   const [updated] = await tx
@@ -563,6 +668,44 @@ export async function dispatchTransferOrder(
   }
 
   return { order: dto, warnings: dispatched.warnings };
+}
+
+function lotKey(lotId: string | null): string {
+  return lotId ?? '__UNLOTTED__';
+}
+
+function compareEarliestExpiringFirst(
+  a: TransferOrderLineLotRow,
+  b: TransferOrderLineLotRow,
+): number {
+  if (a.expDate && b.expDate) {
+    if (a.expDate < b.expDate) return -1;
+    if (a.expDate > b.expDate) return 1;
+  } else if (a.expDate && !b.expDate) {
+    return -1;
+  } else if (!a.expDate && b.expDate) {
+    return 1;
+  }
+  const createdDiff = a.createdAt.getTime() - b.createdAt.getTime();
+  if (createdDiff !== 0) return createdDiff;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+function compareLatestExpiringFirst(
+  a: TransferOrderLineLotRow,
+  b: TransferOrderLineLotRow,
+): number {
+  if (a.expDate && b.expDate) {
+    if (a.expDate > b.expDate) return -1;
+    if (a.expDate < b.expDate) return 1;
+  } else if (a.expDate && !b.expDate) {
+    return -1;
+  } else if (!a.expDate && b.expDate) {
+    return 1;
+  }
+  const createdDiff = b.createdAt.getTime() - a.createdAt.getTime();
+  if (createdDiff !== 0) return createdDiff;
+  return b.id < a.id ? -1 : b.id > a.id ? 1 : 0;
 }
 
 export async function receiveTransferOrder(
@@ -602,6 +745,23 @@ export async function receiveTransferOrder(
     .where(eq(transferOrderLines.transferOrderId, to.id))
     .for('update');
 
+  const lineIds = lineRows.map((l) => l.id);
+  const lineLotRows =
+    lineIds.length > 0
+      ? await tx
+          .select()
+          .from(transferOrderLineLots)
+          .where(inArray(transferOrderLineLots.transferOrderLineId, lineIds))
+          .for('update')
+      : [];
+
+  const lineLotsByLineId = new Map<string, TransferOrderLineLotRow[]>();
+  for (const row of lineLotRows) {
+    const list = lineLotsByLineId.get(row.transferOrderLineId) ?? [];
+    list.push(row);
+    lineLotsByLineId.set(row.transferOrderLineId, list);
+  }
+
   const lineById = new Map<string, TransferOrderLineRow>(lineRows.map((l) => [l.id, l]));
   const incomingQtyByLineId = new Map<string, Quantity>();
 
@@ -637,30 +797,141 @@ export async function receiveTransferOrder(
     }
   }
 
+  const now = new Date();
   const lineOccurrenceCount = new Map<string, number>();
-  const receiveLines: ReceiveTransferLine[] = input.lines.map((reqLine) => {
+  const receiveLines: ReceiveTransferLine[] = [];
+
+  for (const reqLine of input.lines) {
     const line = lineById.get(reqLine.orderLineId)!;
     const count = (lineOccurrenceCount.get(line.id) ?? 0) + 1;
     lineOccurrenceCount.set(line.id, count);
     const keySeed = count === 1 ? line.id : `${line.id}:${count}`;
+    const lineIdemKey = options.deriveLineIdempotencyKey(keySeed);
+    const lotsForLine = lineLotsByLineId.get(line.id) ?? [];
 
-    return {
-      skuId: line.skuId,
-      destinationLocationId: to.destinationLocationId,
-      quantity: reqLine.quantity,
-      dispatchUnitCost: toUnitCost(line.dispatchUnitCost ?? ZERO_DECIMAL4),
-      currency: line.currency,
-      note: input.note ?? null,
-      referenceType: 'TRANSFER_ORDER',
-      referenceId: to.id,
-      actorId: options.actorId,
-      idempotencyKey: options.deriveLineIdempotencyKey(keySeed),
-    };
-  });
+    if (reqLine.lotAllocations && reqLine.lotAllocations.length > 0) {
+      let allocSum = toQuantity(ZERO_DECIMAL4);
+      const seenLots = new Set<string>();
+      for (const alloc of reqLine.lotAllocations) {
+        const lk = lotKey(alloc.lotId);
+        if (seenLots.has(lk)) {
+          throw new ValidationError(
+            ERROR_CODES.VALIDATION_ERROR,
+            `Duplicate lotId ${alloc.lotId} in lotAllocations`,
+          );
+        }
+        seenLots.add(lk);
+        allocSum = add(allocSum, alloc.quantity);
+      }
+      if (!isZero(sub(allocSum, reqLine.quantity))) {
+        throw new ValidationError(
+          ERROR_CODES.LOT_ALLOCATION_MISMATCH,
+          `Lot allocations sum (${allocSum}) must equal received quantity (${reqLine.quantity})`,
+        );
+      }
+
+      const groupId = reqLine.lotAllocations.length > 1 ? uuidv7() : null;
+      for (let idx = 0; idx < reqLine.lotAllocations.length; idx++) {
+        const alloc = reqLine.lotAllocations[idx]!;
+        const lotRow = lotsForLine.find((l) => l.lotId === alloc.lotId);
+        if (!lotRow) {
+          throw new NotFoundError(
+            ERROR_CODES.NOT_FOUND,
+            `Dispatched lot ${alloc.lotId} not found on Transfer Order line ${line.id}`,
+          );
+        }
+        const openQty = sub(
+          toQuantity(lotRow.dispatchedQty),
+          add(toQuantity(lotRow.receivedQty), toQuantity(lotRow.discrepancyQty)),
+        );
+        if (gt(alloc.quantity, openQty)) {
+          throw new ValidationError(
+            ERROR_CODES.OVER_RECEIVE_TRANSFER_NOT_ALLOWED,
+            `Receiving ${alloc.quantity} for lot ${alloc.lotId} exceeds remaining in-transit quantity ${openQty}.`,
+          );
+        }
+        lotRow.receivedQty = add(toQuantity(lotRow.receivedQty), alloc.quantity);
+        await tx
+          .update(transferOrderLineLots)
+          .set({ receivedQty: lotRow.receivedQty, updatedAt: now })
+          .where(eq(transferOrderLineLots.id, lotRow.id));
+
+        receiveLines.push({
+          skuId: line.skuId,
+          destinationLocationId: to.destinationLocationId,
+          lotId: lotRow.lotId,
+          sliceIndex: idx,
+          movementGroupId: groupId,
+          quantity: alloc.quantity,
+          dispatchUnitCost: toUnitCost(lotRow.dispatchUnitCost),
+          currency: lotRow.currency,
+          note: input.note ?? null,
+          referenceType: 'TRANSFER_ORDER',
+          referenceId: to.id,
+          actorId: options.actorId,
+          idempotencyKey: lineIdemKey,
+        });
+      }
+    } else if (lotsForLine.length > 0) {
+      const sortedLots = [...lotsForLine].sort(compareEarliestExpiringFirst);
+      let remaining = reqLine.quantity;
+      const slices: Array<{ lotRow: TransferOrderLineLotRow; quantity: Quantity }> = [];
+
+      for (const lotRow of sortedLots) {
+        if (!isPositive(remaining)) break;
+        const openQty = sub(
+          toQuantity(lotRow.dispatchedQty),
+          add(toQuantity(lotRow.receivedQty), toQuantity(lotRow.discrepancyQty)),
+        );
+        if (!isPositive(openQty)) continue;
+        const take = lt(remaining, openQty) ? remaining : openQty;
+        lotRow.receivedQty = add(toQuantity(lotRow.receivedQty), take);
+        await tx
+          .update(transferOrderLineLots)
+          .set({ receivedQty: lotRow.receivedQty, updatedAt: now })
+          .where(eq(transferOrderLineLots.id, lotRow.id));
+        slices.push({ lotRow, quantity: take });
+        remaining = sub(remaining, take);
+      }
+
+      const groupId = slices.length > 1 ? uuidv7() : null;
+      for (let idx = 0; idx < slices.length; idx++) {
+        const s = slices[idx]!;
+        receiveLines.push({
+          skuId: line.skuId,
+          destinationLocationId: to.destinationLocationId,
+          lotId: s.lotRow.lotId,
+          sliceIndex: idx,
+          movementGroupId: groupId,
+          quantity: s.quantity,
+          dispatchUnitCost: toUnitCost(s.lotRow.dispatchUnitCost),
+          currency: s.lotRow.currency,
+          note: input.note ?? null,
+          referenceType: 'TRANSFER_ORDER',
+          referenceId: to.id,
+          actorId: options.actorId,
+          idempotencyKey: lineIdemKey,
+        });
+      }
+    } else {
+      receiveLines.push({
+        skuId: line.skuId,
+        destinationLocationId: to.destinationLocationId,
+        lotId: null,
+        quantity: reqLine.quantity,
+        dispatchUnitCost: toUnitCost(line.dispatchUnitCost ?? ZERO_DECIMAL4),
+        currency: line.currency,
+        note: input.note ?? null,
+        referenceType: 'TRANSFER_ORDER',
+        referenceId: to.id,
+        actorId: options.actorId,
+        idempotencyKey: lineIdemKey,
+      });
+    }
+  }
 
   const received = await receiveTransfer(tx, receiveLines, { emit: options.emit });
 
-  const now = new Date();
   const updatedReceivedByLineId = new Map<string, Quantity>();
   for (const line of lineRows) {
     const delta = incomingQtyByLineId.get(line.id);
@@ -755,13 +1026,125 @@ export async function closeTransferOrderDiscrepancy(
     .where(eq(transferOrderLines.transferOrderId, to.id))
     .for('update');
 
+  const lineIds = lineRows.map((l) => l.id);
+  const lineLotRows =
+    lineIds.length > 0
+      ? await tx
+          .select()
+          .from(transferOrderLineLots)
+          .where(inArray(transferOrderLineLots.transferOrderLineId, lineIds))
+          .for('update')
+      : [];
+
+  const lineLotsByLineId = new Map<string, TransferOrderLineLotRow[]>();
+  for (const row of lineLotRows) {
+    const list = lineLotsByLineId.get(row.transferOrderLineId) ?? [];
+    list.push(row);
+    lineLotsByLineId.set(row.transferOrderLineId, list);
+  }
+
+  const inputLineById = new Map((input.lines ?? []).map((l) => [l.orderLineId, l]));
+  const now = new Date();
   const closeLines: CloseTransferDiscrepancyLine[] = [];
+
   for (const line of lineRows) {
     const remaining = sub(toQuantity(line.dispatchedQty), toQuantity(line.receivedQty));
-    if (isPositive(remaining)) {
+    if (!isPositive(remaining)) {
+      continue;
+    }
+
+    const lotsForLine = lineLotsByLineId.get(line.id) ?? [];
+    const reqLine = inputLineById.get(line.id);
+
+    if (reqLine?.lotAllocations && reqLine.lotAllocations.length > 0) {
+      let allocSum = toQuantity(ZERO_DECIMAL4);
+      const seenLots = new Set<string>();
+      for (const alloc of reqLine.lotAllocations) {
+        const lk = lotKey(alloc.lotId);
+        if (seenLots.has(lk)) {
+          throw new ValidationError(
+            ERROR_CODES.VALIDATION_ERROR,
+            `Duplicate lotId ${alloc.lotId} in discrepancy lotAllocations`,
+          );
+        }
+        seenLots.add(lk);
+        allocSum = add(allocSum, alloc.quantity);
+      }
+      if (!isZero(sub(allocSum, remaining))) {
+        throw new ValidationError(
+          ERROR_CODES.LOT_ALLOCATION_MISMATCH,
+          `Discrepancy lot allocations sum (${allocSum}) must equal remaining short quantity (${remaining})`,
+        );
+      }
+
+      for (const alloc of reqLine.lotAllocations) {
+        const lotRow = lotsForLine.find((l) => l.lotId === alloc.lotId);
+        if (!lotRow) {
+          throw new NotFoundError(
+            ERROR_CODES.NOT_FOUND,
+            `Dispatched lot ${alloc.lotId} not found on Transfer Order line ${line.id}`,
+          );
+        }
+        const openQty = sub(
+          toQuantity(lotRow.dispatchedQty),
+          add(toQuantity(lotRow.receivedQty), toQuantity(lotRow.discrepancyQty)),
+        );
+        if (gt(alloc.quantity, openQty)) {
+          throw new ValidationError(
+            ERROR_CODES.VALIDATION_ERROR,
+            `Discrepancy quantity ${alloc.quantity} for lot ${alloc.lotId} exceeds remaining in-transit quantity ${openQty}`,
+          );
+        }
+        lotRow.discrepancyQty = add(toQuantity(lotRow.discrepancyQty), alloc.quantity);
+        await tx
+          .update(transferOrderLineLots)
+          .set({ discrepancyQty: lotRow.discrepancyQty, updatedAt: now })
+          .where(eq(transferOrderLineLots.id, lotRow.id));
+
+        closeLines.push({
+          skuId: line.skuId,
+          destinationLocationId: to.destinationLocationId,
+          lotId: lotRow.lotId,
+          quantity: alloc.quantity,
+          referenceType: 'TRANSFER_ORDER',
+          referenceId: to.id,
+          actorId: options.actorId,
+        });
+      }
+    } else if (lotsForLine.length > 0) {
+      // Default: attribute shortages to latest-expiring in-transit Stock Lot first
+      const sortedLots = [...lotsForLine].sort(compareLatestExpiringFirst);
+      let toAllocate = remaining;
+      for (const lotRow of sortedLots) {
+        if (!isPositive(toAllocate)) break;
+        const openQty = sub(
+          toQuantity(lotRow.dispatchedQty),
+          add(toQuantity(lotRow.receivedQty), toQuantity(lotRow.discrepancyQty)),
+        );
+        if (!isPositive(openQty)) continue;
+        const take = lt(toAllocate, openQty) ? toAllocate : openQty;
+        lotRow.discrepancyQty = add(toQuantity(lotRow.discrepancyQty), take);
+        await tx
+          .update(transferOrderLineLots)
+          .set({ discrepancyQty: lotRow.discrepancyQty, updatedAt: now })
+          .where(eq(transferOrderLineLots.id, lotRow.id));
+
+        closeLines.push({
+          skuId: line.skuId,
+          destinationLocationId: to.destinationLocationId,
+          lotId: lotRow.lotId,
+          quantity: take,
+          referenceType: 'TRANSFER_ORDER',
+          referenceId: to.id,
+          actorId: options.actorId,
+        });
+        toAllocate = sub(toAllocate, take);
+      }
+    } else {
       closeLines.push({
         skuId: line.skuId,
         destinationLocationId: to.destinationLocationId,
+        lotId: null,
         quantity: remaining,
         referenceType: 'TRANSFER_ORDER',
         referenceId: to.id,
@@ -780,7 +1163,7 @@ export async function closeTransferOrderDiscrepancy(
       status: 'CLOSED_WITH_DISCREPANCY',
       discrepancyReason: input.reason,
       discrepancyNote: input.note,
-      updatedAt: new Date(),
+      updatedAt: now,
     })
     .where(eq(transferOrders.id, to.id))
     .returning();

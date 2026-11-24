@@ -604,6 +604,39 @@ export type TransferOrderStatus = z.infer<typeof TransferOrderStatusSchema>;
 export const DiscrepancyReasonSchema = z.enum(['LOST', 'DAMAGED', 'OTHER']);
 export type DiscrepancyReason = z.infer<typeof DiscrepancyReasonSchema>;
 
+export interface TransferOrderLineLot {
+  id: string;
+  transferOrderLineId: string;
+  lotId: string | null;
+  lotCode?: string | null | undefined;
+  dispatchedQty: Quantity;
+  receivedQty: Quantity;
+  discrepancyQty: Quantity;
+  dispatchUnitCost?: UnitCost | undefined;
+  dispatchWacUnitCost?: UnitCost | undefined;
+  currency: string;
+  expDate: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const TransferOrderLineLotSchema: z.ZodType<TransferOrderLineLot, z.ZodTypeDef, unknown> =
+  z.object({
+    id: z.string().uuid(),
+    transferOrderLineId: z.string().uuid(),
+    lotId: z.string().uuid().nullable(),
+    lotCode: z.string().nullable().optional(),
+    dispatchedQty: zQuantity,
+    receivedQty: zQuantity,
+    discrepancyQty: zQuantity,
+    dispatchUnitCost: zUnitCost.optional(),
+    dispatchWacUnitCost: zUnitCost.optional(),
+    currency: z.string().length(3),
+    expDate: z.string().nullable(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  });
+
 export interface TransferOrderLine {
   id: string;
   transferOrderId: string;
@@ -615,6 +648,7 @@ export interface TransferOrderLine {
   receivedQty: Quantity;
   dispatchUnitCost?: UnitCost | null | undefined;
   currency: string;
+  lots?: TransferOrderLineLot[] | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -631,6 +665,7 @@ export const TransferOrderLineSchema: z.ZodType<TransferOrderLine, z.ZodTypeDef,
     receivedQty: zQuantity,
     dispatchUnitCost: zUnitCost.nullable().optional(),
     currency: z.string().length(3),
+    lots: z.array(TransferOrderLineLotSchema).optional(),
     createdAt: z.string(),
     updatedAt: z.string(),
   });
@@ -753,19 +788,87 @@ export const ListTransferOrdersQuerySchema = CursorPaginationQuerySchema.extend(
 });
 export type ListTransferOrdersQuery = z.infer<typeof ListTransferOrdersQuerySchema>;
 
-export const DispatchTransferOrderInputSchema = z.object({
-  note: z.string().trim().max(1000).nullable().optional(),
+export interface NullableLotAllocationInput {
+  lotId: string | null;
+  quantity: Quantity;
+}
+
+export interface NullableLotAllocationRawInput {
+  lotId: string | null;
+  quantity: string;
+}
+
+export const NullableLotAllocationInputSchema: z.ZodType<
+  NullableLotAllocationInput,
+  z.ZodTypeDef,
+  NullableLotAllocationRawInput
+> = z.object({
+  lotId: z.string().uuid().nullable(),
+  quantity: zQuantity.refine((val) => isPositive(val), {
+    message: 'Lot allocation quantity must be greater than zero',
+  }),
 });
-export type DispatchTransferOrderInput = z.infer<typeof DispatchTransferOrderInputSchema>;
+
+export interface DispatchTransferOrderLineInput {
+  orderLineId: string;
+  lotAllocations?: LotAllocationInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
+}
+
+export interface DispatchTransferOrderLineRawInput {
+  orderLineId: string;
+  lotAllocations?: LotAllocationRawInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
+}
+
+export const DispatchTransferOrderLineInputSchema: z.ZodType<
+  DispatchTransferOrderLineInput,
+  z.ZodTypeDef,
+  DispatchTransferOrderLineRawInput
+> = z.object({
+  orderLineId: z.string().uuid(),
+  lotAllocations: z.array(LotAllocationInputSchema).max(200).optional(),
+  confirmExpiredLotOverride: z.boolean().optional(),
+  overrideReason: z.string().trim().max(500).nullable().optional(),
+});
+
+export interface DispatchTransferOrderInput {
+  note?: string | null | undefined;
+  lines?: DispatchTransferOrderLineInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
+}
+
+export interface DispatchTransferOrderRawInput {
+  note?: string | null | undefined;
+  lines?: DispatchTransferOrderLineRawInput[] | undefined;
+  confirmExpiredLotOverride?: boolean | undefined;
+  overrideReason?: string | null | undefined;
+}
+
+export const DispatchTransferOrderInputSchema: z.ZodType<
+  DispatchTransferOrderInput,
+  z.ZodTypeDef,
+  DispatchTransferOrderRawInput
+> = z.object({
+  note: z.string().trim().max(1000).nullable().optional(),
+  lines: z.array(DispatchTransferOrderLineInputSchema).max(500).optional(),
+  confirmExpiredLotOverride: z.boolean().optional(),
+  overrideReason: z.string().trim().max(500).nullable().optional(),
+});
 
 export interface ReceiveTransferOrderLineInput {
   orderLineId: string;
   quantity: Quantity;
+  lotAllocations?: NullableLotAllocationInput[] | undefined;
 }
 
 export interface ReceiveTransferOrderLineRawInput {
   orderLineId: string;
   quantity: string;
+  lotAllocations?: NullableLotAllocationRawInput[] | undefined;
 }
 
 export const ReceiveTransferOrderLineInputSchema: z.ZodType<
@@ -777,6 +880,7 @@ export const ReceiveTransferOrderLineInputSchema: z.ZodType<
   quantity: zQuantity.refine((val) => isPositive(val), {
     message: 'Receive quantity must be greater than zero',
   }),
+  lotAllocations: z.array(NullableLotAllocationInputSchema).max(200).optional(),
 });
 
 export interface ReceiveTransferOrderInput {
@@ -805,8 +909,43 @@ export const ReceiveTransferOrderResultSchema = z.object({
 });
 export type ReceiveTransferOrderResult = z.infer<typeof ReceiveTransferOrderResultSchema>;
 
-export const CloseTransferDiscrepancyInputSchema = z.object({
+export interface CloseTransferDiscrepancyLineInput {
+  orderLineId: string;
+  lotAllocations?: NullableLotAllocationInput[] | undefined;
+}
+
+export interface CloseTransferDiscrepancyLineRawInput {
+  orderLineId: string;
+  lotAllocations?: NullableLotAllocationRawInput[] | undefined;
+}
+
+export const CloseTransferDiscrepancyLineInputSchema: z.ZodType<
+  CloseTransferDiscrepancyLineInput,
+  z.ZodTypeDef,
+  CloseTransferDiscrepancyLineRawInput
+> = z.object({
+  orderLineId: z.string().uuid(),
+  lotAllocations: z.array(NullableLotAllocationInputSchema).max(200).optional(),
+});
+
+export interface CloseTransferDiscrepancyInput {
+  reason: DiscrepancyReason;
+  note: string;
+  lines?: CloseTransferDiscrepancyLineInput[] | undefined;
+}
+
+export interface CloseTransferDiscrepancyRawInput {
+  reason: DiscrepancyReason;
+  note: string;
+  lines?: CloseTransferDiscrepancyLineRawInput[] | undefined;
+}
+
+export const CloseTransferDiscrepancyInputSchema: z.ZodType<
+  CloseTransferDiscrepancyInput,
+  z.ZodTypeDef,
+  CloseTransferDiscrepancyRawInput
+> = z.object({
   reason: DiscrepancyReasonSchema,
   note: z.string().trim().min(1, 'Discrepancy note is required').max(1000),
+  lines: z.array(CloseTransferDiscrepancyLineInputSchema).max(500).optional(),
 });
-export type CloseTransferDiscrepancyInput = z.infer<typeof CloseTransferDiscrepancyInputSchema>;
