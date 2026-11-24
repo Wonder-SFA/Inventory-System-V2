@@ -235,3 +235,34 @@ export function calculateWeightedAverageCost(
     estimatedNegativeStock: false,
   };
 }
+
+/**
+ * Weighted average blending at 4-decimal precision for repeat receipts of the same Stock Lot (ADR-0009):
+ * - When `existingQty <= 0`: returns `incomingUnitCost`.
+ * - When `existingQty + receivedQty <= 0`: preserves `existingUnitCost`.
+ * - Otherwise: `(existingQty * existingUnitCost + receivedQty * incomingUnitCost) / (existingQty + receivedQty)`.
+ */
+export function calculateBlendedLotCost(
+  existingQty: Quantity,
+  existingUnitCost: UnitCost,
+  receivedQty: Quantity,
+  incomingUnitCost: UnitCost,
+): UnitCost {
+  const dExistingQty = new DecimalEngine(existingQty);
+  const dExistingCost = new DecimalEngine(existingUnitCost);
+  const dReceivedQty = new DecimalEngine(receivedQty);
+  const dIncomingCost = new DecimalEngine(incomingUnitCost);
+
+  const dNewQty = dExistingQty.plus(dReceivedQty);
+
+  if (dNewQty.lte(0)) {
+    return toCanonicalString(dExistingCost) as UnitCost;
+  }
+
+  if (dExistingQty.lte(0)) {
+    return toCanonicalString(dIncomingCost) as UnitCost;
+  }
+
+  const totalValue = dExistingQty.times(dExistingCost).plus(dReceivedQty.times(dIncomingCost));
+  return toCanonicalString(totalValue.div(dNewQty)) as UnitCost;
+}

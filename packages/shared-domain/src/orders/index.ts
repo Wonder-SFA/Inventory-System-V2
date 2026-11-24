@@ -10,7 +10,7 @@ import {
   zUnitCost,
 } from '../decimal/index.js';
 import { CursorPaginationQuerySchema } from '../http/index.js';
-import { StockMovementSchema } from '../stock/index.js';
+import { StockMovementSchema, zIsoDate } from '../stock/index.js';
 
 export const SupplierStatusSchema = z.enum(['ACTIVE', 'ARCHIVED']);
 export type SupplierStatus = z.infer<typeof SupplierStatusSchema>;
@@ -213,6 +213,9 @@ export interface ReceivePurchaseOrderLineInput {
   quantity: Quantity;
   unitCost?: UnitCost | undefined;
   currency?: string | undefined;
+  lotCode?: string | undefined;
+  mfgDate?: string | null | undefined;
+  expDate?: string | null | undefined;
 }
 
 export interface ReceivePurchaseOrderLineRawInput {
@@ -220,6 +223,9 @@ export interface ReceivePurchaseOrderLineRawInput {
   quantity: string;
   unitCost?: string | undefined;
   currency?: string | undefined;
+  lotCode?: string | undefined;
+  mfgDate?: string | null | undefined;
+  expDate?: string | null | undefined;
 }
 
 export const ReceivePurchaseOrderLineInputSchema: z.ZodType<
@@ -237,6 +243,9 @@ export const ReceivePurchaseOrderLineInputSchema: z.ZodType<
     })
     .optional(),
   currency: z.string().trim().length(3).toUpperCase().optional(),
+  lotCode: z.string().trim().min(1, 'Lot code cannot be empty').max(100).optional(),
+  mfgDate: zIsoDate.nullable().optional(),
+  expDate: zIsoDate.nullable().optional(),
 });
 
 export interface ReceivePurchaseOrderInput {

@@ -611,4 +611,156 @@ describe('orders: suppliers & purchase order lifecycle integration', () => {
     expect(postCancelReceipt.statusCode).toBe(409);
     expect(postCancelReceipt.json().error.code).toBe(ERROR_CODES.INVALID_ORDER_STATE);
   });
+
+  it('captures lotCode/mfgDate/expDate on PO receipts for lot-tracked SKUs, rejects missing/conflicting expiry, and blends repeat-delivery costs', async () => {
+    const { app, cookie, sku1Id, location1Id } = await setupFixture();
+
+    const baseSkuRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/skus/${sku1Id}`,
+      headers: { cookie },
+    });
+    const baseSku = baseSkuRes.json().data;
+
+    const lotSkuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId: baseSku.productId,
+        unitOfMeasureId: baseSku.unitOfMeasureId,
+        code: 'LOT-PO-SKU',
+        name: 'Lot PO Item',
+        trackLots: true,
+        trackExpiry: true,
+      },
+    });
+    expect(lotSkuRes.statusCode).toBe(201);
+    const lotSkuId = lotSkuRes.json().data.id as string;
+
+    const supRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/suppliers',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Batch Supplier' },
+    });
+    const supplierId = supRes.json().data.id as string;
+
+    const poRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/purchase-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        supplierId,
+        locationId: location1Id,
+        lines: [
+          { skuId: sku1Id, orderedQty: '5.0000', unitCost: '4.0000', currency: 'USD' },
+          { skuId: lotSkuId, orderedQty: '10.0000', unitCost: '10.0000', currency: 'USD' },
+        ],
+      },
+    });
+    expect(poRes.statusCode).toBe(201);
+    const po = poRes.json().data as PurchaseOrder;
+    const nonLotLine = po.lines.find((l) => l.skuId === sku1Id)!;
+    const lotLine = po.lines.find((l) => l.skuId === lotSkuId)!;
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+
+    // Missing lotCode on lot-tracked SKU -> 422
+    const missingLotRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { lines: [{ orderLineId: lotLine.id, quantity: '6.0000' }] },
+    });
+    expect(missingLotRes.statusCode).toBe(422);
+    expect(missingLotRes.json().error.code).toBe(ERROR_CODES.LOT_CODE_REQUIRED);
+
+    // Missing expDate on expiry-tracked SKU -> 422
+    const missingExpRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { lines: [{ orderLineId: lotLine.id, quantity: '6.0000', lotCode: 'PO-LOT-1' }] },
+    });
+    expect(missingExpRes.statusCode).toBe(422);
+    expect(missingExpRes.json().error.code).toBe(ERROR_CODES.EXPIRY_DATE_REQUIRED);
+
+    // Receive non-lot line (no lot fields) + partial lot-tracked line (6 @ 10.0000)
+    const rec1Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          { orderLineId: nonLotLine.id, quantity: '5.0000' },
+          {
+            orderLineId: lotLine.id,
+            quantity: '6.0000',
+            unitCost: '10.0000',
+            lotCode: 'PO-LOT-1',
+            mfgDate: '2026-01-15',
+            expDate: '2027-01-15',
+          },
+        ],
+      },
+    });
+    expect(rec1Res.statusCode).toBe(201);
+    const rec1Movements = rec1Res.json().data.movements;
+    const nonLotMov = rec1Movements.find((m: { skuId: string }) => m.skuId === sku1Id);
+    const lotMov1 = rec1Movements.find((m: { skuId: string }) => m.skuId === lotSkuId);
+    expect(nonLotMov.lotId).toBeNull();
+    expect(nonLotMov.unitCost).toBe('4.0000');
+    expect(nonLotMov.wacUnitCost).toBe('4.0000');
+    expect(lotMov1.lotCode).toBe('PO-LOT-1');
+    expect(lotMov1.unitCost).toBe('10.0000');
+    expect(lotMov1.wacUnitCost).toBe('10.0000');
+
+    // Repeat delivery with conflicting expDate -> 422
+    const conflictExpRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: lotLine.id,
+            quantity: '4.0000',
+            unitCost: '15.0000',
+            lotCode: 'po-lot-1',
+            expDate: '2028-01-15',
+          },
+        ],
+      },
+    });
+    expect(conflictExpRes.statusCode).toBe(422);
+    expect(conflictExpRes.json().error.code).toBe(ERROR_CODES.LOT_EXPIRY_MISMATCH);
+
+    // Repeat delivery with matching expDate and different unitCost (4 @ 15.0000) -> blended WAC = 12.0000
+    const rec2Res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: lotLine.id,
+            quantity: '4.0000',
+            unitCost: '15.0000',
+            lotCode: 'po-lot-1',
+            expDate: '2027-01-15',
+          },
+        ],
+      },
+    });
+    expect(rec2Res.statusCode).toBe(201);
+    const lotMov2 = rec2Res.json().data.movements[0];
+    expect(lotMov2.lotId).toBe(lotMov1.lotId);
+    expect(lotMov2.unitCost).toBe('15.0000');
+    expect(lotMov2.wacUnitCost).toBe('12.0000');
+  });
 });

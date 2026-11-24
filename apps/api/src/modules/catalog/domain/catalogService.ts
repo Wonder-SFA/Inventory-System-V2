@@ -22,8 +22,10 @@ import {
 export type CatalogDbExecutor = Database | DbTransaction;
 
 export type SkuReferenceChecker = (db: CatalogDbExecutor, skuId: string) => Promise<boolean>;
+export type SkuPositiveStockChecker = (db: CatalogDbExecutor, skuId: string) => Promise<boolean>;
 
 const skuReferenceCheckers = new Set<SkuReferenceChecker>();
+const skuPositiveStockCheckers = new Set<SkuPositiveStockChecker>();
 
 export function registerSkuReferenceChecker(checker: SkuReferenceChecker): () => void {
   skuReferenceCheckers.add(checker);
@@ -32,8 +34,24 @@ export function registerSkuReferenceChecker(checker: SkuReferenceChecker): () =>
   };
 }
 
+export function registerSkuPositiveStockChecker(checker: SkuPositiveStockChecker): () => void {
+  skuPositiveStockCheckers.add(checker);
+  return () => {
+    skuPositiveStockCheckers.delete(checker);
+  };
+}
+
 export async function hasSkuReferences(db: CatalogDbExecutor, skuId: string): Promise<boolean> {
   for (const checker of skuReferenceCheckers) {
+    if (await checker(db, skuId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function hasPositiveOnHandStock(db: CatalogDbExecutor, skuId: string): Promise<boolean> {
+  for (const checker of skuPositiveStockCheckers) {
     if (await checker(db, skuId)) {
       return true;
     }
@@ -71,6 +89,8 @@ export function toSkuDto(row: SkuRow): Sku {
     code: row.code,
     name: row.name,
     defaultSellingPrice: row.defaultSellingPrice !== null ? toMoney(row.defaultSellingPrice) : null,
+    trackLots: row.trackLots,
+    trackExpiry: row.trackExpiry,
     status: row.status,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
