@@ -5,11 +5,17 @@ import {
   type Product,
   SSE_TOPICS,
   type Sku,
+  type StockBalance,
   type UnitOfMeasure,
 } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
 import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
+import {
+  type CutoverLocationTarget,
+  type LocationLotAssignment,
+  OpeningLotCutoverModal,
+} from '../../components/OpeningLotCutoverModal';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 type CatalogTab = 'skus' | 'products' | 'units';
@@ -58,6 +64,11 @@ export default function CatalogPage() {
   const [skuPrice, setSkuPrice] = useState('');
   const [skuTrackLots, setSkuTrackLots] = useState(false);
   const [skuTrackExpiry, setSkuTrackExpiry] = useState(false);
+
+  // Hybrid cutover modal state
+  const [cutoverOpen, setCutoverOpen] = useState(false);
+  const [cutoverLocations, setCutoverLocations] = useState<CutoverLocationTarget[]>([]);
+  const [pendingSkuPayload, setPendingSkuPayload] = useState<Record<string, unknown> | null>(null);
 
   const productMap = useMemo(() => {
     const map = new Map<string, Product>();
@@ -308,6 +319,27 @@ export default function CatalogPage() {
         trackExpiry: skuTrackLots ? skuTrackExpiry : false,
       };
       if (editingSkuId) {
+        const existingSku = skus.find((s) => s.id === editingSkuId);
+        if (existingSku && !existingSku.trackLots && skuTrackLots) {
+          const balRes = await apiFetchPaginated<StockBalance>(
+            `/api/v1/stock-balances?skuId=${encodeURIComponent(editingSkuId)}&view=per-location&limit=100`,
+          );
+          const positiveLocs: CutoverLocationTarget[] = balRes.data
+            .filter((b) => b.locationId !== null && Number.parseFloat(b.onHand) > 0)
+            .map((b) => ({
+              locationId: b.locationId!,
+              locationName: b.locationName ?? b.locationId!,
+              unlottedOnHand: b.onHand,
+              currency: b.currency,
+            }));
+          if (positiveLocs.length > 0) {
+            setPendingSkuPayload(payload);
+            setCutoverLocations(positiveLocs);
+            setCutoverOpen(true);
+            setBusy(false);
+            return;
+          }
+        }
         await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
           method: 'PATCH',
           body: JSON.stringify(payload),
@@ -325,6 +357,42 @@ export default function CatalogPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleSkipProspectiveCutover() {
+    if (!editingSkuId || !pendingSkuPayload) return;
+    await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(pendingSkuPayload),
+    });
+    setCutoverOpen(false);
+    setPendingSkuPayload(null);
+    setCutoverLocations([]);
+    resetSkuForm();
+    await loadSkus(skuStatusFilter, skuProductFilter);
+  }
+
+  async function handleConfirmOpeningAssign(assignments: LocationLotAssignment[]) {
+    if (!editingSkuId || !pendingSkuPayload) return;
+    await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(pendingSkuPayload),
+    });
+    for (const assignment of assignments) {
+      await apiFetch('/api/v1/stock-lots/assign-opening', {
+        method: 'POST',
+        body: JSON.stringify({
+          skuId: editingSkuId,
+          locationId: assignment.locationId,
+          lots: assignment.lots,
+        }),
+      });
+    }
+    setCutoverOpen(false);
+    setPendingSkuPayload(null);
+    setCutoverLocations([]);
+    resetSkuForm();
+    await loadSkus(skuStatusFilter, skuProductFilter);
   }
 
   async function handleToggleSkuArchive(sku: Sku) {
@@ -929,6 +997,26 @@ export default function CatalogPage() {
           </div>
         )}
       </div>
+
+      {editingSkuId && (
+        <OpeningLotCutoverModal
+          open={cutoverOpen}
+          mode="cutover"
+          sku={{
+            id: editingSkuId,
+            code: skuCode,
+            name: skuName,
+            trackExpiry: skuTrackExpiry,
+          }}
+          locations={cutoverLocations}
+          onClose={() => {
+            setCutoverOpen(false);
+            setPendingSkuPayload(null);
+          }}
+          onSkipProspective={handleSkipProspectiveCutover}
+          onConfirmAssign={handleConfirmOpeningAssign}
+        />
+      )}
     </AppShell>
   );
 }

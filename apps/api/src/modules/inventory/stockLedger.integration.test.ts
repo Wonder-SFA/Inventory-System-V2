@@ -1054,14 +1054,14 @@ describe('inventory stock ledger, projected balances, WAC & concurrency integrat
       expect(lotBal?.unitCost).toBe('7.0000');
     });
 
-    // 7. Turning trackLots=true on sku1Id (which now has 5.0000 on hand) is blocked by inventory's positive-stock checker
+    // 7. Turning trackLots=true on sku1Id (which now has 5.0000 on hand) succeeds for hybrid cutover
     const patchPositive = await app.inject({
       method: 'PATCH',
       url: `/api/v1/skus/${sku1Id}`,
       headers: { cookie, 'idempotency-key': uuidv7() },
       payload: { trackLots: true },
     });
-    expect(patchPositive.statusCode).toBe(422);
-    expect(patchPositive.json().error.code).toBe(ERROR_CODES.SKU_HAS_POSITIVE_STOCK);
+    expect(patchPositive.statusCode).toBe(200);
+    expect(patchPositive.json().data.trackLots).toBe(true);
   });
 });

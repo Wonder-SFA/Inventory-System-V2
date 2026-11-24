@@ -1,6 +1,7 @@
 import type { Database } from '@iv2/db';
 import {
   type ApiWarning,
+  type AssignOpeningLotLineInput,
   BadRequestError,
   type Decimal4,
   ERROR_CODES,
@@ -18,6 +19,9 @@ import {
   NotFoundError,
   type PlanFefoAllocationResult,
   type Quantity,
+  type RecentReceiptCostItem,
+  type RecentReceiptCostsQuery,
+  type RecentReceiptCostsResult,
   type StockBalance,
   type StockLotBalance,
   type StockMovement,
@@ -49,7 +53,7 @@ import {
   toUnitCost,
   uuidv7,
 } from '@iv2/shared-domain';
-import { type SQL, and, asc, eq, gte, inArray, lte, or, sql } from 'drizzle-orm';
+import { type SQL, and, asc, desc, eq, gte, inArray, isNotNull, lte, or, sql } from 'drizzle-orm';
 import {
   type DbTransaction,
   type DomainEventInput,
@@ -2275,7 +2279,7 @@ async function buildBalanceValuationRows(
     ...new Set(entries.map((e) => e.locationId).filter((id): id is string => id !== null)),
   ];
 
-  const [skus, locRows] = await Promise.all([
+  const [skus, locRows, lotBalSums] = await Promise.all([
     getSkusByIds(db, skuIds),
     locIds.length > 0
       ? db
@@ -2283,10 +2287,25 @@ async function buildBalanceValuationRows(
           .from(locations)
           .where(inArray(locations.id, locIds))
       : Promise.resolve([]),
+    locIds.length > 0
+      ? db
+          .select({
+            skuId: stockLots.skuId,
+            locationId: stockLotBalances.locationId,
+            totalSlotted: sql<string>`COALESCE(SUM(${stockLotBalances.onHand}), 0)`,
+          })
+          .from(stockLotBalances)
+          .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
+          .where(and(inArray(stockLots.skuId, skuIds), inArray(stockLotBalances.locationId, locIds)))
+          .groupBy(stockLots.skuId, stockLotBalances.locationId)
+      : Promise.resolve([]),
   ]);
 
   const skuMap = new Map(skus.map((s) => [s.id, s]));
   const locMap = new Map(locRows.map((l) => [l.id, l.name]));
+  const slottedMap = new Map(
+    lotBalSums.map((r) => [`${r.skuId}:${r.locationId}`, toQuantity(r.totalSlotted)]),
+  );
 
   return entries.map((entry) => {
     const valuationStatus: ValuationStatus = isZeroOrNegative(entry.onHand)
@@ -2300,6 +2319,12 @@ async function buildBalanceValuationRows(
       sellingPrice,
       entry.weightedAverageCost,
     );
+    let unlottedOnHand: Quantity | undefined;
+    if (entry.locationId !== null && sku?.trackLots) {
+      const slotted = slottedMap.get(`${entry.skuId}:${entry.locationId}`) ?? toQuantity(ZERO_DECIMAL4);
+      const diff = sub(entry.onHand, slotted);
+      unlottedOnHand = isPositive(diff) ? diff : toQuantity(ZERO_DECIMAL4);
+    }
 
     return {
       skuId: entry.skuId,
@@ -2312,6 +2337,7 @@ async function buildBalanceValuationRows(
       reserved: entry.reserved,
       available: entry.available,
       inTransit: entry.inTransit,
+      ...(unlottedOnHand !== undefined ? { unlottedOnHand } : {}),
       weightedAverageCost: entry.weightedAverageCost,
       totalValue: entry.totalValue,
       sellingPrice,
@@ -2711,6 +2737,331 @@ export async function getStockLotsByIds(
     lotCode: r.lotCode,
     expDate: r.expDate ?? null,
   }));
+}
+
+export async function getRecentReceiptCosts(
+  db: Database | DbTransaction,
+  scope: LocationScope,
+  skuId: UUID,
+  query: RecentReceiptCostsQuery,
+): Promise<RecentReceiptCostsResult> {
+  if ('allLocations' in scope && !scope.allLocations) {
+    return {
+      skuId,
+      locationId: query.locationId ?? null,
+      suggestedUnitCost: null,
+      currency: 'USD',
+      recentReceipts: [],
+    };
+  }
+  if ('locationIds' in scope && scope.locationIds.length === 0) {
+    return {
+      skuId,
+      locationId: query.locationId ?? null,
+      suggestedUnitCost: null,
+      currency: 'USD',
+      recentReceipts: [],
+    };
+  }
+
+  const conditions: SQL[] = [
+    eq(stockMovements.skuId, skuId),
+    eq(stockMovements.type, 'RECEIPT'),
+    eq(stockMovements.referenceType, 'PURCHASE_ORDER'),
+    isNotNull(stockMovements.unitCost),
+  ];
+
+  if (query.locationId) {
+    conditions.push(eq(stockMovements.locationId, query.locationId));
+  } else if ('locationIds' in scope) {
+    conditions.push(inArray(stockMovements.locationId, [...scope.locationIds]));
+  }
+
+  const rows = await db
+    .select({
+      movementId: stockMovements.id,
+      referenceId: stockMovements.referenceId,
+      locationId: stockMovements.locationId,
+      quantityDelta: stockMovements.quantityDelta,
+      unitCost: stockMovements.unitCost,
+      currency: stockMovements.currency,
+      createdAt: stockMovements.createdAt,
+    })
+    .from(stockMovements)
+    .where(and(...conditions))
+    .orderBy(desc(stockMovements.createdAt), desc(stockMovements.id))
+    .limit(query.limit);
+
+  const recentReceipts: RecentReceiptCostItem[] = rows.map((r) => ({
+    movementId: r.movementId,
+    referenceId: r.referenceId ?? null,
+    locationId: r.locationId,
+    quantity: toQuantity(r.quantityDelta),
+    recentUnitCost: toUnitCost(r.unitCost!),
+    currency: r.currency,
+    createdAt: r.createdAt.toISOString(),
+  }));
+
+  let suggestedUnitCost: UnitCost | null =
+    recentReceipts.length > 0 ? recentReceipts[0]!.recentUnitCost! : null;
+  let currency = recentReceipts.length > 0 ? recentReceipts[0]!.currency : 'USD';
+
+  if (suggestedUnitCost === null && query.locationId) {
+    const [bal] = await db
+      .select({
+        weightedAverageCost: stockBalances.weightedAverageCost,
+        currency: stockBalances.currency,
+      })
+      .from(stockBalances)
+      .where(and(eq(stockBalances.skuId, skuId), eq(stockBalances.locationId, query.locationId)))
+      .limit(1);
+    if (bal) {
+      currency = bal.currency;
+      const wac = toUnitCost(bal.weightedAverageCost);
+      if (isPositive(wac)) {
+        suggestedUnitCost = wac;
+      }
+    }
+  }
+
+  return {
+    skuId,
+    locationId: query.locationId ?? null,
+    suggestedUnitCost,
+    currency,
+    recentReceipts,
+  };
+}
+
+export interface AssignOpeningLotsParams {
+  skuId: UUID;
+  locationId: UUID;
+  lots: readonly AssignOpeningLotLineInput[];
+  currency?: string | undefined;
+  note?: string | null | undefined;
+  actorId: string;
+  idempotencyKey: string;
+}
+
+export interface AssignOpeningLotsResult {
+  movements: StockMovement[];
+  assignedQuantity: Quantity;
+  remainingUnlottedQuantity: Quantity;
+  replayed: boolean;
+}
+
+export async function assignOpeningLots(
+  tx: DbTransaction,
+  params: AssignOpeningLotsParams,
+  options?: { emit?: EmitEventFn | undefined },
+): Promise<AssignOpeningLotsResult> {
+  if (params.lots.length === 0) {
+    throw new ValidationError(ERROR_CODES.VALIDATION_ERROR, 'At least one opening lot is required');
+  }
+
+  // Idempotency replay check
+  const existingMovements = await tx
+    .select()
+    .from(stockMovements)
+    .where(eq(stockMovements.idempotencyKey, params.idempotencyKey))
+    .orderBy(asc(stockMovements.sliceIndex));
+
+  if (existingMovements.length > 0) {
+    const lotIds = existingMovements
+      .map((m) => m.lotId)
+      .filter((id): id is string => id !== null);
+    const lotMap = new Map(
+      (await getStockLotsByIds(tx, lotIds)).map((l) => [l.id, l.lotCode]),
+    );
+    const negRow = existingMovements.find((m) => m.lotId === null);
+    const assignedQuantity = negRow ? abs(toQuantity(negRow.quantityDelta)) : toQuantity(ZERO_DECIMAL4);
+
+    const [bal] = await tx
+      .select({ onHand: stockBalances.onHand })
+      .from(stockBalances)
+      .where(and(eq(stockBalances.skuId, params.skuId), eq(stockBalances.locationId, params.locationId)))
+      .limit(1);
+    const totalOnHand = bal ? toQuantity(bal.onHand) : toQuantity(ZERO_DECIMAL4);
+    const lotBalRows = await tx
+      .select({ onHand: stockLotBalances.onHand })
+      .from(stockLotBalances)
+      .innerJoin(stockLots, eq(stockLotBalances.lotId, stockLots.id))
+      .where(and(eq(stockLots.skuId, params.skuId), eq(stockLotBalances.locationId, params.locationId)));
+    let slotted = toQuantity(ZERO_DECIMAL4);
+    for (const r of lotBalRows) {
+      slotted = add(slotted, toQuantity(r.onHand));
+    }
+    const diff = sub(totalOnHand, slotted);
+    const remainingUnlottedQuantity = isPositive(diff) ? diff : toQuantity(ZERO_DECIMAL4);
+
+    return {
+      movements: existingMovements.map((m) =>
+        toStockMovementDto(m, undefined, undefined, m.lotId ? (lotMap.get(m.lotId) ?? null) : null),
+      ),
+      assignedQuantity,
+      remainingUnlottedQuantity,
+      replayed: true,
+    };
+  }
+
+  const skus = await getSkusByIds(tx, [params.skuId]);
+  const sku = skus[0];
+  if (!sku) {
+    throw new NotFoundError(ERROR_CODES.SKU_NOT_FOUND, `SKU ${params.skuId} not found`);
+  }
+  if (!sku.trackLots) {
+    throw new ValidationError(
+      ERROR_CODES.INVALID_LOT_CONFIGURATION,
+      `SKU ${sku.code} must have trackLots enabled before assigning opening lots`,
+    );
+  }
+
+  let totalAssigned = toQuantity(ZERO_DECIMAL4);
+  for (const lot of params.lots) {
+    if (!isPositive(lot.quantity)) {
+      throw new ValidationError(
+        ERROR_CODES.VALIDATION_ERROR,
+        'Opening lot quantity must be greater than zero',
+      );
+    }
+    if (sku.trackExpiry && !lot.expDate) {
+      throw new ValidationError(
+        ERROR_CODES.EXPIRY_DATE_REQUIRED,
+        `Expiry date is required for lot "${lot.lotCode}" on SKU ${sku.code}`,
+      );
+    }
+    totalAssigned = add(totalAssigned, lot.quantity);
+  }
+
+  const pairs: StockPair[] = [{ skuId: params.skuId, locationId: params.locationId }];
+  const balanceMap = await upsertAndLockBalances(tx, pairs);
+  const lotBalanceMap = await lockLotBalancesForPairs(tx, pairs);
+
+  const key = pairKey(params.skuId, params.locationId);
+  const state = balanceMap.get(key);
+  if (!state) {
+    throw new ValidationError(
+      ERROR_CODES.VALIDATION_ERROR,
+      'No positive unlotted stock available at this location to assign',
+    );
+  }
+
+  const lotEntries = lotBalanceMap.get(key) ?? [];
+  let totalSlotted = toQuantity(ZERO_DECIMAL4);
+  for (const entry of lotEntries) {
+    totalSlotted = add(totalSlotted, entry.onHand);
+  }
+  const unlottedOnHand = sub(state.onHand, totalSlotted);
+  if (!isPositive(unlottedOnHand)) {
+    throw new ValidationError(
+      ERROR_CODES.VALIDATION_ERROR,
+      'No positive unlotted stock available at this location to assign',
+    );
+  }
+
+  if (isPositive(sub(totalAssigned, unlottedOnHand))) {
+    throw new ValidationError(
+      ERROR_CODES.VALIDATION_ERROR,
+      `Declared lot quantities (${totalAssigned}) exceed available positive unlotted stock (${unlottedOnHand})`,
+    );
+  }
+
+  const effectiveCurrency = params.currency ?? state.currency ?? 'USD';
+  const groupId = uuidv7();
+  const insertedMovements: StockMovement[] = [];
+
+  // Slice 0: -totalAssigned from unlotted stock (lotId = null)
+  const [unlottedRow] = await tx
+    .insert(stockMovements)
+    .values({
+      id: uuidv7(),
+      type: 'ADJUSTMENT',
+      skuId: params.skuId,
+      locationId: params.locationId,
+      lotId: null,
+      sliceIndex: 0,
+      movementGroupId: groupId,
+      quantityDelta: negate(totalAssigned),
+      unitCost: state.weightedAverageCost,
+      wacUnitCost: state.weightedAverageCost,
+      currency: effectiveCurrency,
+      reasonCategory: 'STOCK_COUNT',
+      note: params.note ?? 'Opening lot assignment (unlotted reclassification)',
+      referenceType: 'OPENING_LOT_ASSIGNMENT',
+      referenceId: groupId,
+      actorId: params.actorId,
+      idempotencyKey: params.idempotencyKey,
+    })
+    .returning();
+
+  const unlottedDto = toStockMovementDto(unlottedRow!, undefined, undefined, null);
+  insertedMovements.push(unlottedDto);
+  await emitOutboxEvent(tx, options?.emit, {
+    eventType: eventTypeForMovement('ADJUSTMENT'),
+    aggregateType: 'stock_movement',
+    aggregateId: unlottedDto.id,
+    payload: unlottedDto,
+  });
+
+  // Slices 1..N: +qty per declared Stock Lot
+  for (let idx = 0; idx < params.lots.length; idx++) {
+    const lot = params.lots[idx]!;
+    const lotUnitCost = lot.unitCost ?? state.weightedAverageCost;
+    const { lotId, lotCode } = await upsertAndUpdateStockLot(tx, {
+      skuId: params.skuId,
+      locationId: params.locationId,
+      lotInput: {
+        lotCode: lot.lotCode,
+        mfgDate: lot.mfgDate ?? null,
+        expDate: lot.expDate ?? null,
+      },
+      quantityDelta: lot.quantity,
+      incomingUnitCost: lotUnitCost,
+      currency: effectiveCurrency,
+      blendCost: true,
+    });
+
+    const [lotRow] = await tx
+      .insert(stockMovements)
+      .values({
+        id: uuidv7(),
+        type: 'ADJUSTMENT',
+        skuId: params.skuId,
+        locationId: params.locationId,
+        lotId,
+        sliceIndex: idx + 1,
+        movementGroupId: groupId,
+        quantityDelta: lot.quantity,
+        unitCost: lotUnitCost,
+        wacUnitCost: state.weightedAverageCost,
+        currency: effectiveCurrency,
+        reasonCategory: 'STOCK_COUNT',
+        note: params.note ?? 'Opening lot assignment',
+        referenceType: 'OPENING_LOT_ASSIGNMENT',
+        referenceId: groupId,
+        actorId: params.actorId,
+        idempotencyKey: params.idempotencyKey,
+      })
+      .returning();
+
+    const lotDto = toStockMovementDto(lotRow!, undefined, undefined, lotCode);
+    insertedMovements.push(lotDto);
+    await emitOutboxEvent(tx, options?.emit, {
+      eventType: eventTypeForMovement('ADJUSTMENT'),
+      aggregateType: 'stock_movement',
+      aggregateId: lotDto.id,
+      payload: lotDto,
+    });
+  }
+
+  const remainingUnlottedQuantity = sub(unlottedOnHand, totalAssigned);
+
+  return {
+    movements: insertedMovements,
+    assignedQuantity: totalAssigned,
+    remainingUnlottedQuantity,
+    replayed: false,
+  };
 }
 
 // Keep unused gte import check clean if not needed

@@ -12,6 +12,10 @@ import {
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
 import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
+import {
+  type LocationLotAssignment,
+  OpeningLotCutoverModal,
+} from '../../components/OpeningLotCutoverModal';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 const REASON_CATEGORIES: { value: AdjustmentReasonCategory; label: string }[] = [
@@ -47,6 +51,9 @@ export default function StockBalancesPage() {
   const [adjNote, setAdjNote] = useState('');
   const [modalError, setModalError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // Cycle-count opening lot assignment modal state
+  const [cycleTarget, setCycleTarget] = useState<StockBalance | null>(null);
 
   const loadBalances = useCallback(
     async (
@@ -395,6 +402,24 @@ export default function StockBalancesPage() {
                       ) : (
                         <span className="badge badge-active">Normal</span>
                       )}
+                      {view === 'per-location' &&
+                        row.locationId &&
+                        row.unlottedOnHand &&
+                        Number.parseFloat(row.unlottedOnHand) > 0 && (
+                          <div style={{ marginTop: 6 }}>
+                            <div style={{ fontSize: 11, color: 'var(--muted)' }}>
+                              Unlotted: {row.unlottedOnHand}
+                            </div>
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              style={{ marginTop: 4 }}
+                              onClick={() => setCycleTarget(row)}
+                            >
+                              Assign Lots
+                            </button>
+                          </div>
+                        )}
                     </td>
                   </tr>
                 ))}
@@ -540,6 +565,41 @@ export default function StockBalancesPage() {
             </form>
           </div>
         </div>
+      )}
+      {cycleTarget && cycleTarget.locationId && (
+        <OpeningLotCutoverModal
+          open={true}
+          mode="cycle-count"
+          sku={{
+            id: cycleTarget.skuId,
+            code: cycleTarget.skuCode,
+            name: cycleTarget.skuName,
+            trackExpiry: skus.find((s) => s.id === cycleTarget.skuId)?.trackExpiry ?? false,
+          }}
+          locations={[
+            {
+              locationId: cycleTarget.locationId,
+              locationName: cycleTarget.locationName ?? cycleTarget.locationId,
+              unlottedOnHand: cycleTarget.unlottedOnHand ?? cycleTarget.onHand,
+              currency: cycleTarget.currency,
+            },
+          ]}
+          onClose={() => setCycleTarget(null)}
+          onConfirmAssign={async (assignments: LocationLotAssignment[]) => {
+            for (const assignment of assignments) {
+              await apiFetch('/api/v1/stock-lots/assign-opening', {
+                method: 'POST',
+                body: JSON.stringify({
+                  skuId: cycleTarget.skuId,
+                  locationId: assignment.locationId,
+                  lots: assignment.lots,
+                }),
+              });
+            }
+            setCycleTarget(null);
+            await loadBalances(view, locationId, zeroOrNegativeOnly);
+          }}
+        />
       )}
     </AppShell>
   );

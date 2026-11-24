@@ -1,6 +1,8 @@
 export const INVENTORY_MODULE = 'inventory' as const;
 
 export {
+  type AssignOpeningLotsParams,
+  type AssignOpeningLotsResult,
   type CloseTransferDiscrepancyLine,
   type DispatchTransferLine,
   type DispatchedTransferLineResult,
@@ -13,10 +15,12 @@ export {
   type ReceiveTransferLine,
   type ReserveStockLine,
   type StockPair,
+  assignOpeningLots,
   closeTransferDiscrepancy,
   dispatchTransfer,
   getLocationById,
   getLocationsByIds,
+  getRecentReceiptCosts,
   getStockLotsByIds,
   hasLocationReferences,
   listLocations,
