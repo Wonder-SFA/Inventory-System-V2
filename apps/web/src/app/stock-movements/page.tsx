@@ -201,7 +201,7 @@ export default function StockMovementsPage() {
     }
     let active = true;
     const params = new URLSearchParams({ skuId: issueSkuId, locationId: issueLocationId });
-    void apiFetch<StockLotBalance[]>(`/api/v1/stock-lots/balances?${params.toString()}`)
+    void apiFetch<StockLotBalance[]>(`/api/v1/lot-balances?${params.toString()}`)
       .then((res) => {
         if (active) setIssueLotBalances(res.data);
       })

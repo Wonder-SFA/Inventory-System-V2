@@ -7,7 +7,7 @@ import {
   toUnitCost,
   uuidv7,
 } from '@iv2/shared-domain';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../../app.js';
@@ -793,5 +793,136 @@ describe('inventory FEFO allocation, multi-lot ledger splits & concurrency integ
       quantityDelta: '-5.0000',
       expiredLotOverride: false,
     });
+  });
+
+  it('enforces STRICT_BLOCK and routes FLEXIBLE_UNASSIGNED shortfall to lotId=null without negative lot balances on manual lotAllocations and single-lotId issues', async () => {
+    const { db, skuId, locationId } = await setupLotSkuFixture();
+
+    const rec = await db.transaction((tx) =>
+      postMovements(tx, [
+        {
+          type: 'RECEIPT',
+          skuId,
+          locationId,
+          lotInput: { lotCode: 'LOT-CAP', expDate: '2099-12-31' },
+          quantityDelta: toQuantity('5'),
+          unitCost: toUnitCost('10'),
+          actorId: 'admin-1',
+          idempotencyKey: uuidv7(),
+        },
+      ]),
+    );
+    const lotId = rec.movements[0]!.lotId!;
+
+    // STRICT_BLOCK rejects manual lotAllocations > lot onHand
+    await expect(
+      db.transaction((tx) =>
+        postMovements(tx, [
+          {
+            type: 'ISSUE',
+            skuId,
+            locationId,
+            pickingMode: 'MANUAL_REQUIRED',
+            negativeStockPolicy: 'STRICT_BLOCK',
+            lotAllocations: [{ lotId, quantity: toQuantity('7') }],
+            quantityDelta: toQuantity('-7'),
+            actorId: 'staff-1',
+            idempotencyKey: uuidv7(),
+          },
+        ]),
+      ),
+    ).rejects.toMatchObject({ statusCode: 422, code: ERROR_CODES.INSUFFICIENT_LOT_STOCK });
+
+    // STRICT_BLOCK rejects single-lotId > lot onHand
+    await expect(
+      db.transaction((tx) =>
+        postMovements(tx, [
+          {
+            type: 'ISSUE',
+            skuId,
+            locationId,
+            pickingMode: 'MANUAL_REQUIRED',
+            negativeStockPolicy: 'STRICT_BLOCK',
+            lotId,
+            quantityDelta: toQuantity('-7'),
+            actorId: 'staff-1',
+            idempotencyKey: uuidv7(),
+          },
+        ]),
+      ),
+    ).rejects.toMatchObject({ statusCode: 422, code: ERROR_CODES.INSUFFICIENT_LOT_STOCK });
+
+    // FLEXIBLE_UNASSIGNED with manual lotAllocations > lot onHand:
+    // deducts 3 from lot (leaving 2), then in next call deducts remaining 2 from lot and routes 4 shortfall to lotId=null
+    const flexAllocRes = await db.transaction((tx) =>
+      postMovements(tx, [
+        {
+          type: 'ISSUE',
+          skuId,
+          locationId,
+          pickingMode: 'MANUAL_REQUIRED',
+          negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+          lotAllocations: [{ lotId, quantity: toQuantity('7') }],
+          quantityDelta: toQuantity('-7'),
+          actorId: 'staff-1',
+          idempotencyKey: uuidv7(),
+        },
+      ]),
+    );
+    expect(flexAllocRes.movements).toHaveLength(2);
+    expect(flexAllocRes.movements[0]).toMatchObject({
+      lotId,
+      quantityDelta: '-5.0000',
+    });
+    expect(flexAllocRes.movements[1]).toMatchObject({
+      lotId: null,
+      quantityDelta: '-2.0000',
+    });
+    expect(flexAllocRes.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: 'NEGATIVE_ON_HAND_STOCK' }),
+      ]),
+    );
+
+    // stock_lot_balances.on_hand must be 0.0000, never negative
+    const [lotBalAfterAlloc] = await db
+      .select()
+      .from(stockLotBalances)
+      .where(and(eq(stockLotBalances.lotId, lotId), eq(stockLotBalances.locationId, locationId)));
+    expect(lotBalAfterAlloc!.onHand).toBe('0.0000');
+
+    // FLEXIBLE_UNASSIGNED with single-lotId when lot is already at 0.0000:
+    // routes entire 3 units to lotId=null without driving stock_lot_balances negative
+    const flexSingleRes = await db.transaction((tx) =>
+      postMovements(tx, [
+        {
+          type: 'ISSUE',
+          skuId,
+          locationId,
+          pickingMode: 'MANUAL_REQUIRED',
+          negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+          lotId,
+          quantityDelta: toQuantity('-3'),
+          actorId: 'staff-1',
+          idempotencyKey: uuidv7(),
+        },
+      ]),
+    );
+    expect(flexSingleRes.movements).toHaveLength(1);
+    expect(flexSingleRes.movements[0]).toMatchObject({
+      lotId: null,
+      quantityDelta: '-3.0000',
+    });
+    expect(flexSingleRes.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: 'NEGATIVE_ON_HAND_STOCK' }),
+      ]),
+    );
+
+    const [lotBalAfterSingle] = await db
+      .select()
+      .from(stockLotBalances)
+      .where(and(eq(stockLotBalances.lotId, lotId), eq(stockLotBalances.locationId, locationId)));
+    expect(lotBalAfterSingle!.onHand).toBe('0.0000');
   });
 });

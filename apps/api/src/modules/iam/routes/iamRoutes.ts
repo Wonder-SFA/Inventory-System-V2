@@ -1,5 +1,6 @@
 import type { Database } from '@iv2/db';
 import {
+  CursorPaginationQuerySchema,
   ERROR_CODES,
   EffectiveLotPolicyQuerySchema,
   ForbiddenError,
@@ -232,12 +233,26 @@ export function registerIamRoutes(
   );
 
   // List IAM audit logs (OWNER / SUPER_ADMIN only)
-  typedApp.get('/api/v1/iam/audit-logs', async (request) => {
-    assertCanManageLotPolicies(request.accessPolicy!);
-    const logs = await listAuditLogs(db);
-    return {
-      data: logs,
-      meta: { requestId: request.id },
-    };
-  });
+  typedApp.get(
+    '/api/v1/iam/audit-logs',
+    {
+      schema: {
+        querystring: CursorPaginationQuerySchema,
+      },
+    },
+    async (request) => {
+      assertCanManageLotPolicies(request.accessPolicy!);
+      const query = request.query;
+      const result = await listAuditLogs(db, query);
+      return {
+        data: result.items,
+        page: {
+          limit: query.limit,
+          nextCursor: result.nextCursor,
+          hasMore: result.hasMore,
+        },
+        meta: { requestId: request.id },
+      };
+    },
+  );
 }

@@ -1,6 +1,14 @@
 'use client';
 
-import type { RecentReceiptCostsResult } from '@iv2/shared-domain';
+import {
+  type Decimal4,
+  type RecentReceiptCostsResult,
+  ZERO_DECIMAL4,
+  add,
+  formatDecimal4,
+  gt,
+  isPositive,
+} from '@iv2/shared-domain';
 import { type FormEvent, useEffect, useState } from 'react';
 import { ApiClientError, apiFetch } from '../lib/api-client';
 
@@ -151,8 +159,13 @@ export function OpeningLotCutoverModal({
       );
       if (rows.length === 0) continue;
 
-      let total = 0;
-      const max = Number.parseFloat(loc.unlottedOnHand);
+      let total: Decimal4 = ZERO_DECIMAL4;
+      let max: Decimal4;
+      try {
+        max = formatDecimal4(loc.unlottedOnHand);
+      } catch {
+        max = ZERO_DECIMAL4;
+      }
       const lots: LocationLotAssignment['lots'] = [];
 
       for (const r of rows) {
@@ -160,8 +173,14 @@ export function OpeningLotCutoverModal({
           setError(`Lot code is required at ${loc.locationName}`);
           return;
         }
-        const qty = Number.parseFloat(r.quantity);
-        if (!Number.isFinite(qty) || qty <= 0) {
+        let qty: Decimal4;
+        try {
+          qty = formatDecimal4(r.quantity.trim());
+        } catch {
+          setError(`Quantity must be greater than zero for lot ${r.lotCode} at ${loc.locationName}`);
+          return;
+        }
+        if (!isPositive(qty)) {
           setError(`Quantity must be greater than zero for lot ${r.lotCode} at ${loc.locationName}`);
           return;
         }
@@ -169,19 +188,19 @@ export function OpeningLotCutoverModal({
           setError(`Expiry date is required for lot ${r.lotCode} at ${loc.locationName}`);
           return;
         }
-        total += qty;
+        total = add(total, qty);
         lots.push({
           lotCode: r.lotCode.trim(),
           ...(r.mfgDate ? { mfgDate: r.mfgDate } : {}),
           ...(r.expDate ? { expDate: r.expDate } : {}),
-          quantity: r.quantity.trim(),
+          quantity: qty,
           ...(r.unitCost.trim() ? { unitCost: r.unitCost.trim() } : {}),
         });
       }
 
-      if (total > max + 1e-9) {
+      if (gt(total, max)) {
         setError(
-          `Declared quantities (${total.toFixed(4)}) exceed unlotted stock (${loc.unlottedOnHand}) at ${loc.locationName}`,
+          `Declared quantities (${total}) exceed unlotted stock (${loc.unlottedOnHand}) at ${loc.locationName}`,
         );
         return;
       }
@@ -262,10 +281,15 @@ export function OpeningLotCutoverModal({
           {locations.map((loc) => {
             const rows = rowsByLoc[loc.locationId] ?? [];
             const hint = costHints[loc.locationId];
-            const declaredSum = rows.reduce(
-              (acc, r) => acc + (Number.parseFloat(r.quantity) || 0),
-              0,
-            );
+            const declaredSum = rows.reduce<Decimal4>((acc, r) => {
+              const trimmed = r.quantity.trim();
+              if (!trimmed) return acc;
+              try {
+                return add(acc, formatDecimal4(trimmed));
+              } catch {
+                return acc;
+              }
+            }, ZERO_DECIMAL4);
             return (
               <div
                 key={loc.locationId}
@@ -280,7 +304,7 @@ export function OpeningLotCutoverModal({
                   <div>
                     <strong>{loc.locationName}</strong>
                     <span style={{ marginLeft: 8, fontSize: 12, color: 'var(--muted)' }}>
-                      Unlotted On-Hand: {loc.unlottedOnHand} (Declared: {declaredSum.toFixed(4)})
+                      Unlotted On-Hand: {loc.unlottedOnHand} (Declared: {declaredSum})
                     </span>
                   </div>
                   <button

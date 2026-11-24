@@ -950,10 +950,10 @@ describe('orders: customers & sales order lifecycle integration', () => {
     const expLotId = recRes.json().data.movements[0].lotId as string;
     const freshLotId = recRes.json().data.movements[1].lotId as string;
 
-    // Verify GET /api/v1/stock-lots/balances returns both lots
+    // Verify GET /api/v1/lot-balances returns both lots
     const lotBalRes = await app.inject({
       method: 'GET',
-      url: `/api/v1/stock-lots/balances?skuId=${skuId}&locationId=${locationId}`,
+      url: `/api/v1/lot-balances?skuId=${skuId}&locationId=${locationId}`,
       headers: { cookie: ownerCookie },
     });
     expect(lotBalRes.statusCode).toBe(200);
