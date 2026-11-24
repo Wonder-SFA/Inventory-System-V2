@@ -1,5 +1,11 @@
 import { iamSchema } from '@iv2/db';
-import { boolean, integer, text, timestamp } from 'drizzle-orm/pg-core';
+import type {
+  ActorRole,
+  LotNegativeStockPolicy,
+  LotPickingMode,
+  LotPolicyScopeType,
+} from '@iv2/shared-domain';
+import { boolean, integer, jsonb, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 export type AccessSwitchState = 'ACTIVE' | 'READ_ONLY' | 'SUSPENDED';
 
@@ -9,6 +15,7 @@ export const iamUsers = iamSchema.table('users', {
   email: text('email').notNull().unique(),
   emailVerified: boolean('email_verified').notNull().default(false),
   image: text('image'),
+  role: text('role').$type<ActorRole>().notNull().default('OWNER'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -57,4 +64,31 @@ export const iamSystemSettings = iamSchema.table('system_settings', {
   id: integer('id').primaryKey(),
   accessSwitch: text('access_switch').$type<AccessSwitchState>().notNull().default('ACTIVE'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const iamLotPolicies = iamSchema.table(
+  'lot_policies',
+  {
+    id: uuid('id').primaryKey(),
+    scopeType: text('scope_type').$type<LotPolicyScopeType>().notNull(),
+    scopeId: text('scope_id').notNull().default(''),
+    pickingMode: text('picking_mode').$type<LotPickingMode>(),
+    allowExpiredLotOverride: boolean('allow_expired_lot_override'),
+    negativeStockPolicy: text('negative_stock_policy').$type<LotNegativeStockPolicy>(),
+    updatedBy: text('updated_by').references(() => iamUsers.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('iam_lot_policies_scope_uidx').on(table.scopeType, table.scopeId)],
+);
+
+export const iamAuditLogs = iamSchema.table('audit_logs', {
+  id: uuid('id').primaryKey(),
+  actorId: text('actor_id').notNull(),
+  action: text('action').notNull(),
+  resourceType: text('resource_type').notNull(),
+  resourceId: text('resource_id').notNull(),
+  beforeState: jsonb('before_state'),
+  afterState: jsonb('after_state'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
