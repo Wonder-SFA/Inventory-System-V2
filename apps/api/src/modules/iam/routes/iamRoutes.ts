@@ -1,10 +1,24 @@
 import type { Database } from '@iv2/db';
-import { ERROR_CODES, ForbiddenError, UnauthorizedError } from '@iv2/shared-domain';
+import {
+  CursorPaginationQuerySchema,
+  ERROR_CODES,
+  EffectiveLotPolicyQuerySchema,
+  ForbiddenError,
+  UnauthorizedError,
+  UpsertLotPolicyInputSchema,
+} from '@iv2/shared-domain';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { ZodTypeProvider } from 'fastify-type-provider-zod';
+import { executeCommand } from '../../../shared/command/index.js';
 import {
   type AuthInstance,
+  assertCanManageLotPolicies,
   getAccessSwitch,
+  getUserRole,
+  listAuditLogs,
+  listLotPolicies,
   resolvePolicy,
+  upsertLotPolicy,
 } from '../domain/index.js';
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -97,12 +111,21 @@ export function registerIamRoutes(
       throw new UnauthorizedError('Authentication required', ERROR_CODES.UNAUTHENTICATED);
     }
 
-    const policy = resolvePolicy({
-      id: session.user.id,
-      email: session.user.email,
-      name: session.user.name,
-    });
-    const accessSwitch = await getAccessSwitch(db);
+    const [role, lotPolicies, accessSwitch] = await Promise.all([
+      getUserRole(db, session.user.id),
+      listLotPolicies(db),
+      getAccessSwitch(db),
+    ]);
+
+    const policy = resolvePolicy(
+      {
+        id: session.user.id,
+        email: session.user.email,
+        name: session.user.name,
+        role,
+      },
+      { lotPolicies },
+    );
 
     request.accessPolicy = policy;
     request.accessSwitch = accessSwitch;
@@ -143,4 +166,93 @@ export function registerIamRoutes(
       },
     };
   });
+
+  const typedApp = app.withTypeProvider<ZodTypeProvider>();
+
+  // List configured lot policies
+  typedApp.get('/api/v1/iam/lot-policies', async (request) => {
+    const policies = await listLotPolicies(db);
+    return {
+      data: policies,
+      meta: { requestId: request.id },
+    };
+  });
+
+  // Resolve effective lot policy for the current actor (optionally scoped to a location)
+  typedApp.get(
+    '/api/v1/iam/lot-policies/effective',
+    {
+      schema: {
+        querystring: EffectiveLotPolicyQuerySchema,
+      },
+    },
+    async (request) => {
+      const effective = request.accessPolicy!.resolveLotPolicy({
+        locationId: request.query.locationId,
+      });
+      return {
+        data: effective,
+        meta: { requestId: request.id },
+      };
+    },
+  );
+
+  // Upsert a lot policy at COMPANY, LOCATION, ROLE, or USER scope (OWNER / SUPER_ADMIN only)
+  typedApp.put(
+    '/api/v1/iam/lot-policies',
+    {
+      schema: {
+        body: UpsertLotPolicyInputSchema,
+      },
+    },
+    async (request, reply) => {
+      const policy = request.accessPolicy!;
+      const result = await executeCommand(
+        {
+          actorId: policy.actor.id,
+          method: request.method,
+          path: request.url,
+          payload: request.body,
+          idempotencyKey: request.headers['idempotency-key'] as string | undefined,
+          requireIdempotencyKey: false,
+          accessPolicy: policy,
+          authorize: () => assertCanManageLotPolicies(policy),
+          handler: async (ctx) => {
+            const saved = await upsertLotPolicy(ctx.tx, policy.actor.id, request.body);
+            return { data: saved, statusCode: 200 };
+          },
+        },
+        {
+          db,
+          requestId: request.id,
+          getAccessSwitch: () => request.accessSwitch ?? 'ACTIVE',
+        },
+      );
+      return reply.status(result.statusCode).send(result.body);
+    },
+  );
+
+  // List IAM audit logs (OWNER / SUPER_ADMIN only)
+  typedApp.get(
+    '/api/v1/iam/audit-logs',
+    {
+      schema: {
+        querystring: CursorPaginationQuerySchema,
+      },
+    },
+    async (request) => {
+      assertCanManageLotPolicies(request.accessPolicy!);
+      const query = request.query;
+      const result = await listAuditLogs(db, query);
+      return {
+        data: result.items,
+        page: {
+          limit: query.limit,
+          nextCursor: result.nextCursor,
+          hasMore: result.hasMore,
+        },
+        meta: { requestId: request.id },
+      };
+    },
+  );
 }

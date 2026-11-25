@@ -524,4 +524,103 @@ describe('catalog module integration', () => {
     });
     expect(delUnused.statusCode).toBe(200);
   });
+
+  it('supports opt-in trackLots and trackExpiry flags, enforces trackExpiry => trackLots, and allows enabling trackLots with positive stock (hybrid cutover)', async () => {
+    const { app, cookie } = await setupAuthedApp();
+
+    const uomRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/units-of-measure',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'BOX', name: 'Box' },
+    });
+    const uomId = uomRes.json().data.id as string;
+
+    const prodRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/products',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Milk Powder' },
+    });
+    const productId = prodRes.json().data.id as string;
+
+    // 1. Creating SKU without flags defaults both to false
+    const defaultSkuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { productId, unitOfMeasureId: uomId, code: 'MILK-1', name: 'Milk Plain' },
+    });
+    expect(defaultSkuRes.statusCode).toBe(201);
+    const defaultSku = defaultSkuRes.json().data;
+    expect(defaultSku.trackLots).toBe(false);
+    expect(defaultSku.trackExpiry).toBe(false);
+
+    // 2. Creating SKU with trackExpiry=true and trackLots=false is rejected (422)
+    const invalidCreate = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId,
+        unitOfMeasureId: uomId,
+        code: 'MILK-BAD',
+        name: 'Milk Bad',
+        trackLots: false,
+        trackExpiry: true,
+      },
+    });
+    expect(invalidCreate.statusCode).toBe(422);
+
+    // 3. Creating SKU with trackLots=true and trackExpiry=true succeeds
+    const lotSkuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId,
+        unitOfMeasureId: uomId,
+        code: 'MILK-LOT',
+        name: 'Milk Lot',
+        trackLots: true,
+        trackExpiry: true,
+      },
+    });
+    expect(lotSkuRes.statusCode).toBe(201);
+    const lotSku = lotSkuRes.json().data;
+    expect(lotSku.trackLots).toBe(true);
+    expect(lotSku.trackExpiry).toBe(true);
+
+    // 4. Updating trackLots=false while trackExpiry=true is rejected (422)
+    const invalidPatch = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${lotSku.id}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { trackLots: false },
+    });
+    expect(invalidPatch.statusCode).toBe(422);
+    expect(invalidPatch.json().error.code).toBe(ERROR_CODES.INVALID_LOT_CONFIGURATION);
+
+    // 5. Turning trackLots=true on an existing SKU succeeds (hybrid cutover)
+    const enabledWithStock = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/skus/${defaultSku.id}`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { trackLots: true, trackExpiry: true },
+    });
+    expect(enabledWithStock.statusCode).toBe(200);
+    expect(enabledWithStock.json().data.trackLots).toBe(true);
+    expect(enabledWithStock.json().data.trackExpiry).toBe(true);
+
+    // 6. Lookup returns the updated flags
+
+    const lookupRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/skus/lookup?code=MILK-1',
+      headers: { cookie },
+    });
+    expect(lookupRes.statusCode).toBe(200);
+    expect(lookupRes.json().data.trackLots).toBe(true);
+    expect(lookupRes.json().data.trackExpiry).toBe(true);
+  });
 });

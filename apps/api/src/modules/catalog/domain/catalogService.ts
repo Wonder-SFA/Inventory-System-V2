@@ -71,6 +71,8 @@ export function toSkuDto(row: SkuRow): Sku {
     code: row.code,
     name: row.name,
     defaultSellingPrice: row.defaultSellingPrice !== null ? toMoney(row.defaultSellingPrice) : null,
+    trackLots: row.trackLots,
+    trackExpiry: row.trackExpiry,
     status: row.status,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

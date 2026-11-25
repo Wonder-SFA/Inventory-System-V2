@@ -20,6 +20,18 @@ _Avoid_: UoM, Pack Size, Selling Unit
 
 ### Locations & Stock
 
+**Stock Lot**:
+A distinct batch or production run of a lot-tracked SKU identified by a code and optional manufacturing and expiry dates.
+_Avoid_: Batch Layer, Expiry Group, Serial Pool
+
+**Lot Balance**:
+The on-hand, reserved, and available quantity of a specific Stock Lot at a specific Location.
+_Avoid_: Sub-stock, Batch Count
+
+**FEFO Allocation**:
+First-Expired, First-Out rule where the system automatically allocates stock from the earliest-expiring available Stock Lot at a Location.
+_Avoid_: Expiry Sweep, Auto-Batching
+
 **Location**:
 A physical site where stock is stored or sold (for example, "Main Warehouse" or "Downtown Store").
 _Avoid_: Warehouse, Branch, Site, Bin
@@ -76,7 +88,11 @@ _Avoid_: POS Sale, Register Ring, Walk-in Order
 
 **Weighted Average Cost**:
 The per-unit value of a SKU's On-Hand Stock at a Location, recalculated as the total value of stock on hand plus newly received stock divided by the new total quantity. When stock recovers from zero or negative (`<= 0`) back into positive territory, cost resets to the incoming unit cost; while `On-Hand Stock` remains `<= 0`, the last known cost is preserved and flagged as `"Estimated — Negative Stock"` on Valuation Reports until reconciled.
-_Avoid_: Unit Price, FIFO Cost, Standard Cost
+_Avoid_: Unit Price, Standard Cost
+
+**FIFO Cost**:
+The cost of goods sold and valuation derived from the specific unit cost of the individual Stock Lots or receipt layers allocated under First-In, First-Out or First-Expired, First-Out order.
+_Avoid_: Layer Price, Historic Cost
 
 **Cash Balance**:
 The business's real cash on hand, updated when Purchase Orders, Sales Orders, Quick Counter Sales, or manual income and expense entries are marked paid.

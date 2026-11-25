@@ -2,13 +2,17 @@
 
 import {
   type Customer,
+  type EffectiveLotPolicy,
+  type FefoAllocationSlice,
   type Location,
+  type PlanFefoAllocationResult,
   type ReturnSalesOrderResult,
   SSE_TOPICS,
   type SalesOrder,
   type SalesOrderStatus,
   type ShipSalesOrderResult,
   type Sku,
+  type StockLotBalance,
 } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
@@ -26,6 +30,7 @@ interface DraftLineState {
 
 interface ShipLineState {
   orderLineId: string;
+  skuId: string;
   skuLabel: string;
   orderedQty: string;
   fulfilledQty: string;
@@ -79,6 +84,14 @@ export default function SalesOrdersPage() {
   const [shippingOrder, setShippingOrder] = useState<SalesOrder | null>(null);
   const [shipNote, setShipNote] = useState('');
   const [shipLines, setShipLines] = useState<ShipLineState[]>([]);
+  const [fefoPreviews, setFefoPreviews] = useState<Record<string, FefoAllocationSlice[]>>({});
+  const [shipLotPolicy, setShipLotPolicy] = useState<EffectiveLotPolicy | null>(null);
+  const [lotBalancesByLine, setLotBalancesByLine] = useState<Record<string, StockLotBalance[]>>({});
+  const [manualAllocations, setManualAllocations] = useState<Record<string, Record<string, string>>>({});
+  const [skipLotSelectionByLine, setSkipLotSelectionByLine] = useState<Record<string, boolean>>({});
+  const [confirmExpiredOverride, setConfirmExpiredOverride] = useState(false);
+  const [expiredOverrideReason, setExpiredOverrideReason] = useState('');
+  const [lastAllocatedSummary, setLastAllocatedSummary] = useState<string | null>(null);
   const [shipping, setShipping] = useState(false);
 
   // Return state
@@ -278,22 +291,85 @@ export default function SalesOrdersPage() {
     }
   }
 
+  const loadFefoPreviewForLine = useCallback(
+    async (orderLineId: string, skuId: string, locId: string, quantity: string) => {
+      const sku = skus.find((s) => s.id === skuId);
+      if (!sku?.trackLots || Number(quantity) <= 0) {
+        setFefoPreviews((prev) => ({ ...prev, [orderLineId]: [] }));
+        return;
+      }
+      try {
+        const params = new URLSearchParams({
+          skuId,
+          locationId: locId,
+          quantity: quantity.trim(),
+        });
+        const res = await apiFetch<PlanFefoAllocationResult>(
+          `/api/v1/stock-lots/fefo-preview?${params.toString()}`,
+        );
+        setFefoPreviews((prev) => ({ ...prev, [orderLineId]: res.data.slices }));
+      } catch {
+        setFefoPreviews((prev) => ({ ...prev, [orderLineId]: [] }));
+      }
+    },
+    [skus],
+  );
+
   function openShipModal(so: SalesOrder) {
     setReturningOrder(null);
     setShippingOrder(so);
     setShipNote('');
-    setShipLines(
-      so.lines.map((line) => {
-        const remaining = Math.max(0, Number(line.orderedQty) - Number(line.fulfilledQty));
-        return {
-          orderLineId: line.id,
-          skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName ?? ''}` : line.skuId,
-          orderedQty: line.orderedQty,
-          fulfilledQty: line.fulfilledQty,
-          quantity: remaining > 0 ? remaining.toFixed(4) : '0.0000',
-        };
-      }),
-    );
+    setLastAllocatedSummary(null);
+    setShipLotPolicy(null);
+    setLotBalancesByLine({});
+    setManualAllocations({});
+    setSkipLotSelectionByLine({});
+    setConfirmExpiredOverride(false);
+    setExpiredOverrideReason('');
+
+    const initialLines = so.lines.map((line) => {
+      const remaining = Math.max(0, Number(line.orderedQty) - Number(line.fulfilledQty));
+      return {
+        orderLineId: line.id,
+        skuId: line.skuId,
+        skuLabel: line.skuCode ? `${line.skuCode} — ${line.skuName ?? ''}` : line.skuId,
+        orderedQty: line.orderedQty,
+        fulfilledQty: line.fulfilledQty,
+        quantity: remaining > 0 ? remaining.toFixed(4) : '0.0000',
+      };
+    });
+    setShipLines(initialLines);
+    setFefoPreviews({});
+
+    void apiFetch<EffectiveLotPolicy>(
+      `/api/v1/iam/lot-policies/effective?locationId=${encodeURIComponent(so.locationId)}`,
+    )
+      .then((res) => setShipLotPolicy(res.data))
+      .catch(() => {
+        setShipLotPolicy({
+          pickingMode: 'AUTO_FEFO',
+          allowExpiredLotOverride: false,
+          negativeStockPolicy: 'FLEXIBLE_UNASSIGNED',
+        });
+      });
+
+    for (const line of initialLines) {
+      void loadFefoPreviewForLine(line.orderLineId, line.skuId, so.locationId, line.quantity);
+      const sku = skus.find((s) => s.id === line.skuId);
+      if (sku?.trackLots) {
+        const params = new URLSearchParams({
+          skuId: line.skuId,
+          locationId: so.locationId,
+        });
+        void apiFetch<StockLotBalance[]>(`/api/v1/lot-balances?${params.toString()}`)
+          .then((res) => {
+            setLotBalancesByLine((prev) => ({ ...prev, [line.orderLineId]: res.data }));
+          })
+          .catch(() => {
+            setLotBalancesByLine((prev) => ({ ...prev, [line.orderLineId]: [] }));
+          });
+      }
+    }
     setError(null);
     setWarnings([]);
   }
@@ -302,12 +378,29 @@ export default function SalesOrdersPage() {
     event.preventDefault();
     if (!shippingOrder) return;
 
+    const pickingMode = shipLotPolicy?.pickingMode ?? 'AUTO_FEFO';
     const activeLines = shipLines
       .filter((l) => Number(l.quantity) > 0)
-      .map((l) => ({
-        orderLineId: l.orderLineId,
-        quantity: l.quantity.trim(),
-      }));
+      .map((l) => {
+        const sku = skus.find((s) => s.id === l.skuId);
+        const isManualMode =
+          sku?.trackLots &&
+          (pickingMode === 'MANUAL_REQUIRED' ||
+            (pickingMode === 'MANUAL_OPTIONAL' && !skipLotSelectionByLine[l.orderLineId]));
+
+        const allocMap = manualAllocations[l.orderLineId] ?? {};
+        const lotAllocations = isManualMode
+          ? Object.entries(allocMap)
+              .filter(([, qty]) => Number(qty) > 0)
+              .map(([lotId, qty]) => ({ lotId, quantity: qty.trim() }))
+          : undefined;
+
+        return {
+          orderLineId: l.orderLineId,
+          quantity: l.quantity.trim(),
+          ...(lotAllocations !== undefined ? { lotAllocations } : {}),
+        };
+      });
 
     if (activeLines.length === 0) {
       setError('Enter a positive ship quantity on at least one line.');
@@ -323,12 +416,25 @@ export default function SalesOrdersPage() {
           method: 'POST',
           body: JSON.stringify({
             note: shipNote.trim().length > 0 ? shipNote.trim() : null,
+            confirmExpiredLotOverride: confirmExpiredOverride || undefined,
+            overrideReason:
+              confirmExpiredOverride && expiredOverrideReason.trim().length > 0
+                ? expiredOverrideReason.trim()
+                : undefined,
             lines: activeLines,
           }),
         },
       );
       if (res.warnings && res.warnings.length > 0) {
         setWarnings(res.warnings.map((w) => w.message));
+      }
+      const lotSlices = res.data.movements.filter((m) => m.lotCode || m.movementGroupId);
+      if (lotSlices.length > 0) {
+        setLastAllocatedSummary(
+          lotSlices
+            .map((m) => `${m.lotCode ?? 'Unlotted'} (${m.quantityDelta})`)
+            .join(', '),
+        );
       }
       setShippingOrder(null);
       await loadOrders(statusFilter);
@@ -449,6 +555,22 @@ export default function SalesOrdersPage() {
                 <li key={idx}>{w}</li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {lastAllocatedSummary && (
+          <div
+            role="status"
+            style={{
+              background: '#ecfdf5',
+              border: '1px solid #10b981',
+              color: '#065f46',
+              padding: '10px 14px',
+              borderRadius: 8,
+              fontSize: 13,
+            }}
+          >
+            <strong>Dispatched Lot Allocations:</strong> {lastAllocatedSummary}
           </div>
         )}
 
@@ -603,9 +725,16 @@ export default function SalesOrdersPage() {
 
         {shippingOrder && (
           <div className="card" style={{ borderColor: 'var(--primary)' }}>
-            <h2 style={{ marginTop: 0, fontSize: 16 }}>
-              Ship Items — {shippingOrder.orderNumber}
-            </h2>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h2 style={{ margin: 0, fontSize: 16 }}>
+                Ship Items — {shippingOrder.orderNumber}
+              </h2>
+              {shipLotPolicy && (
+                <span className="badge">
+                  Picking Mode: {shipLotPolicy.pickingMode.replace(/_/g, ' ')}
+                </span>
+              )}
+            </div>
             <form onSubmit={submitShipment} className="stack">
               <div className="form-group">
                 <label htmlFor="ship-note">Shipment Note</label>
@@ -624,31 +753,196 @@ export default function SalesOrdersPage() {
                     <th>Ordered</th>
                     <th>Fulfilled</th>
                     <th>Ship Qty</th>
+                    <th>
+                      {shipLotPolicy?.pickingMode === 'MANUAL_REQUIRED' ||
+                      shipLotPolicy?.pickingMode === 'MANUAL_OPTIONAL'
+                        ? 'Lot Selection'
+                        : 'FEFO Lot Preview'}
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {shipLines.map((line, idx) => (
-                    <tr key={line.orderLineId}>
-                      <td>{line.skuLabel}</td>
-                      <td>{line.orderedQty}</td>
-                      <td>{line.fulfilledQty}</td>
-                      <td>
-                        <input
-                          type="text"
-                          value={line.quantity}
-                          onChange={(e) =>
-                            setShipLines((prev) =>
-                              prev.map((l, i) =>
-                                i === idx ? { ...l, quantity: e.target.value } : l,
-                              ),
-                            )
-                          }
-                        />
-                      </td>
-                    </tr>
-                  ))}
+                  {shipLines.map((line, idx) => {
+                    const previewSlices = fefoPreviews[line.orderLineId] ?? [];
+                    const sku = skus.find((s) => s.id === line.skuId);
+                    const pickingMode = shipLotPolicy?.pickingMode ?? 'AUTO_FEFO';
+                    const isManualMode =
+                      sku?.trackLots &&
+                      (pickingMode === 'MANUAL_REQUIRED' || pickingMode === 'MANUAL_OPTIONAL');
+                    const isSkipped =
+                      pickingMode === 'MANUAL_OPTIONAL' && Boolean(skipLotSelectionByLine[line.orderLineId]);
+                    const lineLots = lotBalancesByLine[line.orderLineId] ?? [];
+                    const lineAlloc = manualAllocations[line.orderLineId] ?? {};
+                    const today = new Date().toISOString().slice(0, 10);
+
+                    return (
+                      <tr key={line.orderLineId}>
+                        <td>{line.skuLabel}</td>
+                        <td>{line.orderedQty}</td>
+                        <td>{line.fulfilledQty}</td>
+                        <td>
+                          <input
+                            type="text"
+                            value={line.quantity}
+                            onChange={(e) => {
+                              const nextQty = e.target.value;
+                              setShipLines((prev) =>
+                                prev.map((l, i) =>
+                                  i === idx ? { ...l, quantity: nextQty } : l,
+                                ),
+                              );
+                              if (shippingOrder) {
+                                void loadFefoPreviewForLine(
+                                  line.orderLineId,
+                                  line.skuId,
+                                  shippingOrder.locationId,
+                                  nextQty,
+                                );
+                              }
+                            }}
+                          />
+                        </td>
+                        <td style={{ fontSize: 12 }}>
+                          {!sku?.trackLots ? (
+                            <span style={{ color: 'var(--muted)' }}>Non-lot SKU</span>
+                          ) : isManualMode ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              {pickingMode === 'MANUAL_OPTIONAL' && (
+                                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 500 }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={isSkipped}
+                                    onChange={(e) =>
+                                      setSkipLotSelectionByLine((prev) => ({
+                                        ...prev,
+                                        [line.orderLineId]: e.target.checked,
+                                      }))
+                                    }
+                                  />
+                                  Skip lot selection (flag EOD reconciliation)
+                                </label>
+                              )}
+                              {!isSkipped && (
+                                <>
+                                  {lineLots.length === 0 ? (
+                                    <span style={{ color: 'var(--muted)' }}>No lot balances at location</span>
+                                  ) : (
+                                    lineLots.map((lot) => {
+                                      const isExpired = lot.expDate !== null && lot.expDate < today;
+                                      return (
+                                        <div
+                                          key={lot.lotId}
+                                          style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                                        >
+                                          <span className="badge">{lot.lotCode}</span>
+                                          <span style={{ color: 'var(--muted)' }}>
+                                            On-hand: {lot.onHand}
+                                            {lot.expDate ? ` · exp ${lot.expDate}` : ''}
+                                          </span>
+                                          {isExpired && (
+                                            <span
+                                              className="badge"
+                                              style={{ background: '#fee2e2', color: '#991b1b' }}
+                                            >
+                                              EXPIRED
+                                            </span>
+                                          )}
+                                          <input
+                                            type="text"
+                                            aria-label={`Qty for ${lot.lotCode}`}
+                                            placeholder="0.0000"
+                                            value={lineAlloc[lot.lotId] ?? ''}
+                                            onChange={(e) => {
+                                              const val = e.target.value;
+                                              setManualAllocations((prev) => ({
+                                                ...prev,
+                                                [line.orderLineId]: {
+                                                  ...(prev[line.orderLineId] ?? {}),
+                                                  [lot.lotId]: val,
+                                                },
+                                              }));
+                                            }}
+                                            style={{ width: 90 }}
+                                          />
+                                        </div>
+                                      );
+                                    })
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          ) : previewSlices.length === 0 ? (
+                            <span style={{ color: 'var(--muted)' }}>—</span>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                              {previewSlices.map((s, sIdx) => (
+                                <div key={sIdx}>
+                                  <span className="badge">
+                                    {s.lotCode ?? (s.negativeStockWarning ? 'Shortfall' : 'Unlotted')}
+                                  </span>{' '}
+                                  × {s.quantity}
+                                  {s.expDate ? ` (exp ${s.expDate})` : ''}
+                                  {s.negativeStockWarning ? ' ⚠ Negative stock' : ''}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
+              {(() => {
+                const today = new Date().toISOString().slice(0, 10);
+                const hasExpiredSelected = shipLines.some((line) => {
+                  const lots = lotBalancesByLine[line.orderLineId] ?? [];
+                  const alloc = manualAllocations[line.orderLineId] ?? {};
+                  return lots.some(
+                    (lot) =>
+                      lot.expDate !== null &&
+                      lot.expDate < today &&
+                      Number(alloc[lot.lotId] ?? 0) > 0,
+                  );
+                });
+                if (!hasExpiredSelected) return null;
+                return (
+                  <div
+                    style={{
+                      padding: 12,
+                      border: '1px solid #d97706',
+                      borderRadius: 6,
+                      background: '#fffbeb',
+                    }}
+                  >
+                    <strong style={{ color: '#92400e', fontSize: 13 }}>
+                      Expired Stock Lot Selected
+                    </strong>
+                    {!shipLotPolicy?.allowExpiredLotOverride ? (
+                      <p style={{ margin: '6px 0 0', fontSize: 12, color: '#991b1b' }}>
+                        Your policy does not permit issuing expired stock lots. Select a fresh lot or contact an authorized manager.
+                      </p>
+                    ) : (
+                      <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                          <input
+                            type="checkbox"
+                            checked={confirmExpiredOverride}
+                            onChange={(e) => setConfirmExpiredOverride(e.target.checked)}
+                          />
+                          Confirm expired-lot override for this shipment
+                        </label>
+                        <input
+                          type="text"
+                          value={expiredOverrideReason}
+                          onChange={(e) => setExpiredOverrideReason(e.target.value)}
+                          placeholder="Override reason (optional)"
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               <div style={{ display: 'flex', gap: 8 }}>
                 <button type="submit" className="btn btn-primary" disabled={shipping}>
                   {shipping ? 'Shipping...' : 'Confirm Shipment'}

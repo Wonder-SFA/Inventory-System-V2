@@ -1,7 +1,7 @@
 import { catalogSchema } from '@iv2/db';
 import type { CatalogStatus } from '@iv2/shared-domain';
 import { sql } from 'drizzle-orm';
-import { check, index, numeric, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { boolean, check, index, numeric, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 export const catalogUnitsOfMeasure = catalogSchema.table(
   'units_of_measure',
@@ -55,12 +55,18 @@ export const catalogSkus = catalogSchema.table(
     code: text('code').notNull(),
     name: text('name').notNull(),
     defaultSellingPrice: numeric('default_selling_price', { precision: 18, scale: 4 }),
+    trackLots: boolean('track_lots').notNull().default(false),
+    trackExpiry: boolean('track_expiry').notNull().default(false),
     status: text('status').$type<CatalogStatus>().notNull().default('ACTIVE'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     check('catalog_skus_status_check', sql`${table.status} IN ('ACTIVE', 'ARCHIVED')`),
+    check(
+      'catalog_skus_track_expiry_requires_lots_chk',
+      sql`NOT ${table.trackExpiry} OR ${table.trackLots}`,
+    ),
     uniqueIndex('catalog_skus_code_lower_uidx').on(sql`LOWER(${table.code})`),
     index('catalog_skus_product_id_idx').on(table.productId),
     index('catalog_skus_unit_of_measure_id_idx').on(table.unitOfMeasureId),

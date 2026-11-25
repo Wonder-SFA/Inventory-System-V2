@@ -8,10 +8,16 @@ import {
   type StockBalance,
   type StockBalanceView,
   type StockMovement,
+  type ValuationCostBasis,
+  type ValuationSummary,
 } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
 import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
+import {
+  type LocationLotAssignment,
+  OpeningLotCutoverModal,
+} from '../../components/OpeningLotCutoverModal';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 const REASON_CATEGORIES: { value: AdjustmentReasonCategory; label: string }[] = [
@@ -27,6 +33,8 @@ export default function StockBalancesPage() {
   const [locations, setLocations] = useState<Location[]>([]);
   const [skus, setSkus] = useState<Sku[]>([]);
   const [view, setView] = useState<StockBalanceView>('per-location');
+  const [costBasis, setCostBasis] = useState<ValuationCostBasis>('FIFO');
+  const [valuationSummary, setValuationSummary] = useState<ValuationSummary | null>(null);
   const [locationId, setLocationId] = useState<string>('');
   const [zeroOrNegativeOnly, setZeroOrNegativeOnly] = useState(false);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -48,9 +56,13 @@ export default function StockBalancesPage() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // Cycle-count opening lot assignment modal state
+  const [cycleTarget, setCycleTarget] = useState<StockBalance | null>(null);
+
   const loadBalances = useCallback(
     async (
       currentView: StockBalanceView,
+      currentCostBasis: ValuationCostBasis,
       currentLocId: string,
       onlyZeroOrNeg: boolean,
       cursor?: string,
@@ -58,6 +70,7 @@ export default function StockBalancesPage() {
       const params = new URLSearchParams();
       params.set('limit', '50');
       params.set('view', currentView);
+      params.set('costBasis', currentCostBasis);
       if (currentView === 'per-location' && currentLocId) {
         params.set('locationId', currentLocId);
       }
@@ -68,13 +81,25 @@ export default function StockBalancesPage() {
         params.set('cursor', cursor);
       }
 
-      const res = await apiFetchPaginated<StockBalance>(
-        `/api/v1/stock-balances?${params.toString()}`,
-      );
+      const summaryParams = new URLSearchParams();
+      summaryParams.set('costBasis', currentCostBasis);
+      if (currentView === 'per-location' && currentLocId) {
+        summaryParams.set('locationId', currentLocId);
+      }
+
+      const [res, valRes] = await Promise.all([
+        apiFetchPaginated<StockBalance>(`/api/v1/stock-balances?${params.toString()}`),
+        cursor
+          ? Promise.resolve(null)
+          : apiFetch<ValuationSummary>(`/api/v1/valuation-summary?${summaryParams.toString()}`),
+      ]);
       if (cursor) {
         setBalances((prev) => [...prev, ...res.data]);
       } else {
         setBalances(res.data);
+        if (valRes) {
+          setValuationSummary(valRes.data);
+        }
       }
       setNextCursor(res.page.nextCursor);
       setHasMore(res.page.hasMore);
@@ -111,7 +136,7 @@ export default function StockBalancesPage() {
     let active = true;
     setLoading(true);
     setError(null);
-    loadBalances(view, locationId, zeroOrNegativeOnly)
+    loadBalances(view, costBasis, locationId, zeroOrNegativeOnly)
       .catch((err) => {
         if (active) {
           setError(err instanceof Error ? err.message : 'Failed to load stock balances');
@@ -126,11 +151,11 @@ export default function StockBalancesPage() {
     return () => {
       active = false;
     };
-  }, [view, locationId, zeroOrNegativeOnly, loadBalances]);
+  }, [view, costBasis, locationId, zeroOrNegativeOnly, loadBalances]);
 
   useLiveRefresh(
     [SSE_TOPICS.STOCK_BALANCES, SSE_TOPICS.LOCATIONS, SSE_TOPICS.CATALOG],
-    () => loadBalances(view, locationId, zeroOrNegativeOnly),
+    () => loadBalances(view, costBasis, locationId, zeroOrNegativeOnly),
   );
 
   const summary = useMemo(() => {
@@ -146,18 +171,24 @@ export default function StockBalancesPage() {
         estimatedNegativeCount += 1;
       }
     }
+    const portfolioTotal =
+      valuationSummary !== null
+        ? (valuationSummary.totalValue ?? null)
+        : hasCosts
+          ? totalInventoryValue.toFixed(4)
+          : null;
     return {
-      totalInventoryValue: hasCosts ? totalInventoryValue.toFixed(4) : null,
+      totalInventoryValue: portfolioTotal,
       estimatedNegativeCount,
       rowCount: balances.length,
     };
-  }, [balances]);
+  }, [balances, valuationSummary]);
 
   async function handleLoadMore() {
     if (!nextCursor) return;
     setLoadingMore(true);
     try {
-      await loadBalances(view, locationId, zeroOrNegativeOnly, nextCursor);
+      await loadBalances(view, costBasis, locationId, zeroOrNegativeOnly, nextCursor);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load more balances');
     } finally {
@@ -193,7 +224,7 @@ export default function StockBalancesPage() {
       setAdjQuantityDelta('');
       setAdjUnitCost('');
       setAdjNote('');
-      await loadBalances(view, locationId, zeroOrNegativeOnly);
+      await loadBalances(view, costBasis, locationId, zeroOrNegativeOnly);
     } catch (err) {
       setModalError(
         err instanceof ApiClientError
@@ -300,6 +331,34 @@ export default function StockBalancesPage() {
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <div
+              role="group"
+              aria-label="Valuation Cost Basis"
+              style={{
+                display: 'inline-flex',
+                border: '1px solid var(--border)',
+                borderRadius: 6,
+                overflow: 'hidden',
+              }}
+            >
+              <button
+                type="button"
+                className={`tab-btn${costBasis === 'FIFO' ? ' active' : ''}`}
+                style={{ borderRadius: 0, borderBottom: 'none', padding: '6px 10px', fontSize: 12 }}
+                onClick={() => setCostBasis('FIFO')}
+              >
+                FIFO Cost
+              </button>
+              <button
+                type="button"
+                className={`tab-btn${costBasis === 'WAC' ? ' active' : ''}`}
+                style={{ borderRadius: 0, borderBottom: 'none', padding: '6px 10px', fontSize: 12 }}
+                onClick={() => setCostBasis('WAC')}
+              >
+                Weighted Avg Cost
+              </button>
+            </div>
+
             {view === 'per-location' && (
               <select
                 aria-label="Filter by Location"
@@ -351,7 +410,7 @@ export default function StockBalancesPage() {
                   <th>Reserved</th>
                   <th>Available</th>
                   <th>In-Transit</th>
-                  <th>Weighted Avg Cost</th>
+                  <th>{costBasis === 'FIFO' ? 'Unit Cost (FIFO)' : 'Weighted Avg Cost'}</th>
                   <th>Total Value</th>
                   <th>Selling Price</th>
                   <th>Gross Margin</th>
@@ -371,7 +430,13 @@ export default function StockBalancesPage() {
                     <td>{row.available}</td>
                     <td>{row.inTransit}</td>
                     <td>
-                      {row.weightedAverageCost !== undefined ? row.weightedAverageCost : '—'}
+                      {costBasis === 'FIFO'
+                        ? row.unitCost !== undefined
+                          ? row.unitCost
+                          : '—'
+                        : row.weightedAverageCost !== undefined
+                          ? row.weightedAverageCost
+                          : '—'}
                     </td>
                     <td>{row.totalValue !== undefined ? row.totalValue : '—'}</td>
                     <td>{row.sellingPrice ?? '—'}</td>
@@ -395,6 +460,24 @@ export default function StockBalancesPage() {
                       ) : (
                         <span className="badge badge-active">Normal</span>
                       )}
+                      {view === 'per-location' &&
+                        row.locationId &&
+                        row.unlottedOnHand &&
+                        Number.parseFloat(row.unlottedOnHand) > 0 && (
+                          <div style={{ marginTop: 6 }}>
+                            <div style={{ fontSize: 11, color: 'var(--muted)' }}>
+                              Unlotted: {row.unlottedOnHand}
+                            </div>
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              style={{ marginTop: 4 }}
+                              onClick={() => setCycleTarget(row)}
+                            >
+                              Assign Lots
+                            </button>
+                          </div>
+                        )}
                     </td>
                   </tr>
                 ))}
@@ -540,6 +623,41 @@ export default function StockBalancesPage() {
             </form>
           </div>
         </div>
+      )}
+      {cycleTarget && cycleTarget.locationId && (
+        <OpeningLotCutoverModal
+          open={true}
+          mode="cycle-count"
+          sku={{
+            id: cycleTarget.skuId,
+            code: cycleTarget.skuCode,
+            name: cycleTarget.skuName,
+            trackExpiry: skus.find((s) => s.id === cycleTarget.skuId)?.trackExpiry ?? false,
+          }}
+          locations={[
+            {
+              locationId: cycleTarget.locationId,
+              locationName: cycleTarget.locationName ?? cycleTarget.locationId,
+              unlottedOnHand: cycleTarget.unlottedOnHand ?? cycleTarget.onHand,
+              currency: cycleTarget.currency,
+            },
+          ]}
+          onClose={() => setCycleTarget(null)}
+          onConfirmAssign={async (assignments: LocationLotAssignment[]) => {
+            for (const assignment of assignments) {
+              await apiFetch('/api/v1/stock-lots/assign-opening', {
+                method: 'POST',
+                body: JSON.stringify({
+                  skuId: cycleTarget.skuId,
+                  locationId: assignment.locationId,
+                  lots: assignment.lots,
+                }),
+              });
+            }
+            setCycleTarget(null);
+            await loadBalances(view, costBasis, locationId, zeroOrNegativeOnly);
+          }}
+        />
       )}
     </AppShell>
   );

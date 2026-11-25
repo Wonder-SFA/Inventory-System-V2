@@ -5,6 +5,7 @@ import {
   type SalesOrder,
   type StockBalance,
   type StockMovement,
+  WARNING_CODES,
   uuidv7,
 } from '@iv2/shared-domain';
 import type { Pool } from 'pg';
@@ -602,5 +603,545 @@ describe('orders: customers & sales order lifecycle integration', () => {
 
     await outboxDispatcher.drainOutbox();
     expect(emittedEvents.map((e) => e.eventType)).toContain('OrderCancelled');
+  });
+
+  it('reserves at (SKU, Location) on confirm, dispatches multi-lot FEFO slices on ship, and enforces STRICT_BLOCK policy', async () => {
+    const { app, cookie, locationId, customer } = await setupFixture();
+    const customerId = customer.id;
+
+    const uomRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/units-of-measure',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'BOX', name: 'Boxes' },
+    });
+    expect(uomRes.statusCode).toBe(201);
+    const uomId = uomRes.json().data.id as string;
+
+    const productRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/products',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Perishable Line' },
+    });
+    expect(productRes.statusCode).toBe(201);
+    const productId = productRes.json().data.id as string;
+
+    const supplierRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/suppliers',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Fresh Farms' },
+    });
+    expect(supplierRes.statusCode).toBe(201);
+    const supplierId = supplierRes.json().data.id as string;
+
+    // Create lot+expiry tracked SKU
+    const lotSkuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId,
+        code: 'LOT-SO-01',
+        name: 'Perishable Widget',
+        unitOfMeasureId: uomId,
+        trackLots: true,
+        trackExpiry: true,
+      },
+    });
+    expect(lotSkuRes.statusCode).toBe(201);
+    const lotSkuId = lotSkuRes.json().data.id as string;
+
+    // Receive two POs with different expiry dates and unit costs
+    const poRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/purchase-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        supplierId,
+        locationId,
+        lines: [{ skuId: lotSkuId, orderedQty: '8.0000', unitCost: '10.0000', currency: 'USD' }],
+      },
+    });
+    expect(poRes.statusCode).toBe(201);
+    const po = poRes.json().data;
+    const poLineId = po.lines[0].id as string;
+
+    const sendRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(sendRes.statusCode).toBe(200);
+
+    // Receive 3 units into LOT-LATE (exp 2099-12-01, cost $15)
+    const rec1 = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: poLineId,
+            quantity: '3.0000',
+            unitCost: '15.0000',
+            lotCode: 'LOT-LATE',
+            expDate: '2099-12-01',
+          },
+        ],
+      },
+    });
+    expect(rec1.statusCode).toBe(201);
+
+    // Receive 4 units into LOT-EARLY (exp 2099-06-01, cost $10)
+    const rec2 = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: poLineId,
+            quantity: '4.0000',
+            unitCost: '10.0000',
+            lotCode: 'LOT-EARLY',
+            expDate: '2099-06-01',
+          },
+        ],
+      },
+    });
+    expect(rec2.statusCode).toBe(201);
+
+    // Create & confirm Sales Order for 6 units
+    const soRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        customerId,
+        locationId,
+        lines: [{ skuId: lotSkuId, orderedQty: '6.0000', unitPrice: '25.0000', currency: 'USD' }],
+      },
+    });
+    expect(soRes.statusCode).toBe(201);
+    const so = soRes.json().data;
+    const soLineId = so.lines[0].id as string;
+
+    const confirmRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+    expect(confirmRes.statusCode).toBe(200);
+    expect(confirmRes.json().data.status).toBe('CONFIRMED');
+
+    // Verify reservation is held at (SKU, Location)
+    const balBeforeShipRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/stock-balances?skuId=${lotSkuId}&locationId=${locationId}`,
+      headers: { cookie },
+    });
+    const balBeforeShip = balBeforeShipRes.json().data[0] as StockBalance;
+    expect(balBeforeShip.onHand).toBe('7.0000');
+    expect(balBeforeShip.reserved).toBe('6.0000');
+    expect(balBeforeShip.available).toBe('1.0000');
+
+    // Ship 6 units -> should split 4 from LOT-EARLY @ $10 and 2 from LOT-LATE @ $15
+    const shipRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: soLineId, quantity: '6.0000' }],
+      },
+    });
+    expect(shipRes.statusCode).toBe(201);
+    const shipData = shipRes.json().data;
+    expect(shipData.status).toBe('SHIPPED');
+    expect(shipData.movements).toHaveLength(2);
+    expect(shipData.movements[0]).toMatchObject({
+      lotCode: 'LOT-EARLY',
+      sliceIndex: 0,
+      quantityDelta: '-4.0000',
+      unitCost: '10.0000',
+      wacUnitCost: '12.1429',
+    });
+    expect(shipData.movements[1]).toMatchObject({
+      lotCode: 'LOT-LATE',
+      sliceIndex: 1,
+      movementGroupId: shipData.movements[0].movementGroupId,
+      quantityDelta: '-2.0000',
+      unitCost: '15.0000',
+      wacUnitCost: '12.1429',
+    });
+
+    // Configure STRICT_BLOCK at company level and attempt to ship 2 units when only 1 remains
+    const policyRes = await app.inject({
+      method: 'PUT',
+      url: '/api/v1/iam/lot-policies',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        scopeType: 'COMPANY',
+        scopeId: '',
+        negativeStockPolicy: 'STRICT_BLOCK',
+      },
+    });
+    expect(policyRes.statusCode).toBe(200);
+
+    const so2Res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        customerId,
+        locationId,
+        lines: [{ skuId: lotSkuId, orderedQty: '2.0000', unitPrice: '25.0000', currency: 'USD' }],
+      },
+    });
+    const so2 = so2Res.json().data;
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so2.id}/confirm`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+    });
+
+    const strictFailRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so2.id}/shipments`,
+      headers: { cookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: so2.lines[0].id, quantity: '2.0000' }],
+      },
+    });
+    expect(strictFailRes.statusCode).toBe(422);
+    expect(strictFailRes.json().error.code).toBe(ERROR_CODES.INSUFFICIENT_LOT_STOCK);
+  });
+
+  it('enforces MANUAL_REQUIRED, AUTO_FEFO manual bypass rejection, MANUAL_OPTIONAL EOD flag, and expired-lot override on Sales Order shipments', async () => {
+    const db = createDb(pool);
+    const outboxDispatcher = new OutboxDispatcher(db);
+    const app = buildApp({ pool, db, outboxDispatcher, nodeEnv: 'test' });
+
+    const ownerSignUp = await app.inject({
+      method: 'POST',
+      url: '/api/auth/sign-up/email',
+      payload: {
+        name: 'Owner User',
+        email: 'so-owner@example.com',
+        password: 'password1234',
+      },
+    });
+    expect(ownerSignUp.statusCode).toBe(200);
+    const ownerCookie = extractCookieHeader(ownerSignUp.headers['set-cookie']);
+
+    const staffSignUp = await app.inject({
+      method: 'POST',
+      url: '/api/auth/sign-up/email',
+      payload: {
+        name: 'Staff User',
+        email: 'so-staff@example.com',
+        password: 'password1234',
+      },
+    });
+    expect(staffSignUp.statusCode).toBe(200);
+    const staffCookie = extractCookieHeader(staffSignUp.headers['set-cookie']);
+    await pool.query("UPDATE iam.users SET role = 'STAFF' WHERE email = $1", [
+      'so-staff@example.com',
+    ]);
+
+    const uomRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/units-of-measure',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: { code: 'BOX', name: 'Box' },
+    });
+    const uomId = uomRes.json().data.id as string;
+
+    const prodRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/products',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Vaccine Vial' },
+    });
+    const productId = prodRes.json().data.id as string;
+
+    const skuRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skus',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        productId,
+        code: 'VAX-01',
+        name: 'Vaccine Vial 10ml',
+        unitOfMeasureId: uomId,
+        trackLots: true,
+        trackExpiry: true,
+      },
+    });
+    const skuId = skuRes.json().data.id as string;
+
+    const locRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/locations',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'Main Clinic' },
+    });
+    const locationId = locRes.json().data.id as string;
+
+    const supRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/suppliers',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'BioSupply' },
+    });
+    const supplierId = supRes.json().data.id as string;
+
+    const custRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/customers',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: { name: 'City Hospital' },
+    });
+    const customerId = custRes.json().data.id as string;
+
+    // Receive 1 expired lot (2020-01-01) and 1 fresh lot (2099-12-31) via PO
+    const poRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/purchase-orders',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        supplierId,
+        locationId,
+        lines: [
+          { skuId, orderedQty: '5', unitCost: '10', currency: 'USD' },
+          { skuId, orderedQty: '5', unitCost: '12', currency: 'USD' },
+        ],
+      },
+    });
+    const po = poRes.json().data;
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/confirm`,
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+    });
+    const recRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/purchase-orders/${po.id}/receipts`,
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: po.lines[0].id,
+            quantity: '5',
+            lotCode: 'VAX-EXP',
+            expDate: '2020-01-01',
+          },
+          {
+            orderLineId: po.lines[1].id,
+            quantity: '5',
+            lotCode: 'VAX-FRESH',
+            expDate: '2099-12-31',
+          },
+        ],
+      },
+    });
+    expect(recRes.statusCode).toBe(201);
+    const expLotId = recRes.json().data.movements[0].lotId as string;
+    const freshLotId = recRes.json().data.movements[1].lotId as string;
+
+    // Verify GET /api/v1/lot-balances returns both lots
+    const lotBalRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/lot-balances?skuId=${skuId}&locationId=${locationId}`,
+      headers: { cookie: ownerCookie },
+    });
+    expect(lotBalRes.statusCode).toBe(200);
+    expect(lotBalRes.json().data).toHaveLength(2);
+
+    // Create & confirm Sales Order for 4 units
+    const soRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sales-orders',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        customerId,
+        locationId,
+        lines: [{ skuId, orderedQty: '4', unitPrice: '20', currency: 'USD' }],
+      },
+    });
+    const so = soRes.json().data;
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/confirm`,
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+    });
+    const soLineId = so.lines[0].id as string;
+
+    // 1. STAFF under default AUTO_FEFO cannot supply manual lotAllocations -> 403 FORBIDDEN
+    const autoBypassRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: staffCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: soLineId,
+            quantity: '1',
+            lotAllocations: [{ lotId: freshLotId, quantity: '1' }],
+          },
+        ],
+      },
+    });
+    expect(autoBypassRes.statusCode).toBe(403);
+
+    // 2. Configure MANUAL_REQUIRED at location level
+    await app.inject({
+      method: 'PUT',
+      url: '/api/v1/iam/lot-policies',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        scopeType: 'LOCATION',
+        scopeId: locationId,
+        pickingMode: 'MANUAL_REQUIRED',
+      },
+    });
+
+    // Missing lotAllocations -> 422 LOT_CODE_REQUIRED
+    const missingLotRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: staffCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: soLineId, quantity: '1' }],
+      },
+    });
+    expect(missingLotRes.statusCode).toBe(422);
+    expect(missingLotRes.json().error.code).toBe(ERROR_CODES.LOT_CODE_REQUIRED);
+
+    // Mismatched lotAllocations sum -> 422 LOT_ALLOCATION_MISMATCH
+    const mismatchRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: staffCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: soLineId,
+            quantity: '2',
+            lotAllocations: [{ lotId: freshLotId, quantity: '1' }],
+          },
+        ],
+      },
+    });
+    expect(mismatchRes.statusCode).toBe(422);
+    expect(mismatchRes.json().error.code).toBe(ERROR_CODES.LOT_ALLOCATION_MISMATCH);
+
+    // Expired lot without allowExpiredLotOverride permission -> 403 FORBIDDEN
+    const expBlockedRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: soLineId,
+            quantity: '1',
+            lotAllocations: [{ lotId: expLotId, quantity: '1' }],
+          },
+        ],
+      },
+    });
+    expect(expBlockedRes.statusCode).toBe(403);
+
+    // Grant allowExpiredLotOverride to OWNER role
+    await app.inject({
+      method: 'PUT',
+      url: '/api/v1/iam/lot-policies',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        scopeType: 'ROLE',
+        scopeId: 'OWNER',
+        allowExpiredLotOverride: true,
+      },
+    });
+
+    // Authorized actor without confirmExpiredLotOverride -> 422 EXPIRED_LOT_CONFIRMATION_REQUIRED
+    const expUnconfirmedRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [
+          {
+            orderLineId: soLineId,
+            quantity: '1',
+            lotAllocations: [{ lotId: expLotId, quantity: '1' }],
+          },
+        ],
+      },
+    });
+    expect(expUnconfirmedRes.statusCode).toBe(422);
+    expect(expUnconfirmedRes.json().error.code).toBe(ERROR_CODES.EXPIRED_LOT_CONFIRMATION_REQUIRED);
+
+    // Authorized + confirmed -> 201 with expiredLotOverride: true + warning
+    const expConfirmedRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        confirmExpiredLotOverride: true,
+        overrideReason: 'Approved clearance batch',
+        lines: [
+          {
+            orderLineId: soLineId,
+            quantity: '1',
+            lotAllocations: [{ lotId: expLotId, quantity: '1' }],
+          },
+        ],
+      },
+    });
+    expect(expConfirmedRes.statusCode).toBe(201);
+    expect(expConfirmedRes.json().data.movements[0]).toMatchObject({
+      lotId: expLotId,
+      expiredLotOverride: true,
+      overrideReason: 'Approved clearance batch',
+    });
+    expect(expConfirmedRes.json().warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: WARNING_CODES.EXPIRED_LOT_OVERRIDE_USED }),
+      ]),
+    );
+
+    // 3. Switch location to MANUAL_OPTIONAL -> ship 1 unit omitting lotAllocations -> lotId: null + eodReconciliationRequired: true
+    await app.inject({
+      method: 'PUT',
+      url: '/api/v1/iam/lot-policies',
+      headers: { cookie: ownerCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        scopeType: 'LOCATION',
+        scopeId: locationId,
+        pickingMode: 'MANUAL_OPTIONAL',
+      },
+    });
+
+    const optShipRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/sales-orders/${so.id}/shipments`,
+      headers: { cookie: staffCookie, 'idempotency-key': uuidv7() },
+      payload: {
+        lines: [{ orderLineId: soLineId, quantity: '1' }],
+      },
+    });
+    expect(optShipRes.statusCode).toBe(201);
+    expect(optShipRes.json().data.movements[0]).toMatchObject({
+      lotId: null,
+      eodReconciliationRequired: true,
+    });
+    expect(optShipRes.json().warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: WARNING_CODES.EOD_RECONCILIATION_REQUIRED }),
+      ]),
+    );
   });
 });

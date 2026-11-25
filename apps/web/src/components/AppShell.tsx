@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { href: '/catalog', label: 'Catalog' },
   { href: '/locations', label: 'Locations' },
   { href: '/stock-balances', label: 'Stock Balances' },
+  { href: '/lot-balances', label: 'Lot Balances & Expiry' },
   { href: '/stock-movements', label: 'Stock Movements' },
   { href: '/suppliers', label: 'Suppliers' },
   { href: '/purchase-orders', label: 'Purchase Orders' },

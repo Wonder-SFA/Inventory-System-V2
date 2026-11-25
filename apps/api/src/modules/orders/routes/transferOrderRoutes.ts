@@ -229,6 +229,8 @@ export function registerTransferOrderRoutes(
               actorId: policy.actor.id,
               deriveLineIdempotencyKey: ctx.deriveLineIdempotencyKey,
               emit: ctx.emit,
+              resolveLotPolicy: (locationId) => policy.resolveLotPolicy({ locationId }),
+              canManualFefoOverride: (locationId) => policy.canManualFefoOverride({ locationId }),
             });
             return {
               data: policy.redactCosts(dispatched.order),

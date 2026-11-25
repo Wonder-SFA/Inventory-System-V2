@@ -7,6 +7,7 @@ import {
   ZERO_DECIMAL4,
   abs,
   add,
+  calculateBlendedLotCost,
   calculateWeightedAverageCost,
   div,
   eq,
@@ -248,6 +249,42 @@ describe('Decimal4', () => {
         weightedAverageCost: '7.2500',
         estimatedNegativeStock: true,
       });
+    });
+  });
+
+  describe('calculateBlendedLotCost', () => {
+    it('returns incoming unitCost when existing lot quantity is zero or negative', () => {
+      expect(
+        calculateBlendedLotCost(
+          toQuantity('0'),
+          toUnitCost('5.00'),
+          toQuantity('10'),
+          toUnitCost('8.25'),
+        ),
+      ).toBe('8.2500');
+    });
+
+    it('blends existing and incoming lot costs via weighted average at 4-decimal precision', () => {
+      // (10 * 5.00 + 20 * 8.00) / 30 = 210 / 30 = 7.0000
+      expect(
+        calculateBlendedLotCost(
+          toQuantity('10'),
+          toUnitCost('5.00'),
+          toQuantity('20'),
+          toUnitCost('8.00'),
+        ),
+      ).toBe('7.0000');
+
+      // (10 * 5.00 + 5 * 8.00) / 15 = 90 / 15 = 6.0000
+      // (1 * 1.00 + 2 * 2.00) / 3 = 5 / 3 = 1.6667 (rounded half-up)
+      expect(
+        calculateBlendedLotCost(
+          toQuantity('1'),
+          toUnitCost('1.00'),
+          toQuantity('2'),
+          toUnitCost('2.00'),
+        ),
+      ).toBe('1.6667');
     });
   });
 });

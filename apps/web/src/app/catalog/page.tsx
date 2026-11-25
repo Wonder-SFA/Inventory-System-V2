@@ -5,11 +5,17 @@ import {
   type Product,
   SSE_TOPICS,
   type Sku,
+  type StockBalance,
   type UnitOfMeasure,
 } from '@iv2/shared-domain';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { AppShell } from '../../components/AppShell';
 import { useLiveRefresh } from '../../components/LiveInvalidationProvider';
+import {
+  type CutoverLocationTarget,
+  type LocationLotAssignment,
+  OpeningLotCutoverModal,
+} from '../../components/OpeningLotCutoverModal';
 import { ApiClientError, apiFetch, apiFetchPaginated } from '../../lib/api-client';
 
 type CatalogTab = 'skus' | 'products' | 'units';
@@ -56,6 +62,13 @@ export default function CatalogPage() {
   const [skuCode, setSkuCode] = useState('');
   const [skuName, setSkuName] = useState('');
   const [skuPrice, setSkuPrice] = useState('');
+  const [skuTrackLots, setSkuTrackLots] = useState(false);
+  const [skuTrackExpiry, setSkuTrackExpiry] = useState(false);
+
+  // Hybrid cutover modal state
+  const [cutoverOpen, setCutoverOpen] = useState(false);
+  const [cutoverLocations, setCutoverLocations] = useState<CutoverLocationTarget[]>([]);
+  const [pendingSkuPayload, setPendingSkuPayload] = useState<Record<string, unknown> | null>(null);
 
   const productMap = useMemo(() => {
     const map = new Map<string, Product>();
@@ -276,6 +289,8 @@ export default function CatalogPage() {
     setSkuCode(sku.code);
     setSkuName(sku.name);
     setSkuPrice(sku.defaultSellingPrice ?? '');
+    setSkuTrackLots(sku.trackLots);
+    setSkuTrackExpiry(sku.trackExpiry);
   }
 
   function resetSkuForm() {
@@ -285,6 +300,8 @@ export default function CatalogPage() {
     setSkuCode('');
     setSkuName('');
     setSkuPrice('');
+    setSkuTrackLots(false);
+    setSkuTrackExpiry(false);
   }
 
   async function handleSaveSku(e: FormEvent) {
@@ -298,8 +315,31 @@ export default function CatalogPage() {
         code: skuCode,
         name: skuName,
         defaultSellingPrice: skuPrice.trim() === '' ? null : skuPrice.trim(),
+        trackLots: skuTrackLots,
+        trackExpiry: skuTrackLots ? skuTrackExpiry : false,
       };
       if (editingSkuId) {
+        const existingSku = skus.find((s) => s.id === editingSkuId);
+        if (existingSku && !existingSku.trackLots && skuTrackLots) {
+          const balRes = await apiFetchPaginated<StockBalance>(
+            `/api/v1/stock-balances?skuId=${encodeURIComponent(editingSkuId)}&view=per-location&limit=100`,
+          );
+          const positiveLocs: CutoverLocationTarget[] = balRes.data
+            .filter((b) => b.locationId !== null && Number.parseFloat(b.onHand) > 0)
+            .map((b) => ({
+              locationId: b.locationId!,
+              locationName: b.locationName ?? b.locationId!,
+              unlottedOnHand: b.onHand,
+              currency: b.currency,
+            }));
+          if (positiveLocs.length > 0) {
+            setPendingSkuPayload(payload);
+            setCutoverLocations(positiveLocs);
+            setCutoverOpen(true);
+            setBusy(false);
+            return;
+          }
+        }
         await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
           method: 'PATCH',
           body: JSON.stringify(payload),
@@ -317,6 +357,42 @@ export default function CatalogPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleSkipProspectiveCutover() {
+    if (!editingSkuId || !pendingSkuPayload) return;
+    await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(pendingSkuPayload),
+    });
+    setCutoverOpen(false);
+    setPendingSkuPayload(null);
+    setCutoverLocations([]);
+    resetSkuForm();
+    await loadSkus(skuStatusFilter, skuProductFilter);
+  }
+
+  async function handleConfirmOpeningAssign(assignments: LocationLotAssignment[]) {
+    if (!editingSkuId || !pendingSkuPayload) return;
+    await apiFetch<Sku>(`/api/v1/skus/${editingSkuId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(pendingSkuPayload),
+    });
+    for (const assignment of assignments) {
+      await apiFetch('/api/v1/stock-lots/assign-opening', {
+        method: 'POST',
+        body: JSON.stringify({
+          skuId: editingSkuId,
+          locationId: assignment.locationId,
+          lots: assignment.lots,
+        }),
+      });
+    }
+    setCutoverOpen(false);
+    setPendingSkuPayload(null);
+    setCutoverLocations([]);
+    resetSkuForm();
+    await loadSkus(skuStatusFilter, skuProductFilter);
   }
 
   async function handleToggleSkuArchive(sku: Sku) {
@@ -765,6 +841,37 @@ export default function CatalogPage() {
                   placeholder="0.0000"
                 />
               </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                <input
+                  type="checkbox"
+                  checked={skuTrackLots}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setSkuTrackLots(checked);
+                    if (!checked) {
+                      setSkuTrackExpiry(false);
+                    }
+                  }}
+                />
+                Track Lots
+              </label>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontSize: 13,
+                  opacity: skuTrackLots ? 1 : 0.5,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={skuTrackExpiry}
+                  disabled={!skuTrackLots}
+                  onChange={(e) => setSkuTrackExpiry(e.target.checked)}
+                />
+                Track Expiry
+              </label>
               <button type="submit" className="btn btn-primary" disabled={busy}>
                 {editingSkuId ? 'Save SKU' : 'Add SKU'}
               </button>
@@ -821,6 +928,7 @@ export default function CatalogPage() {
                   <th>Product</th>
                   <th>Unit</th>
                   <th>Default Price</th>
+                  <th>Lot Tracking</th>
                   <th>Status</th>
                   <th style={{ width: 240 }}>Actions</th>
                 </tr>
@@ -835,6 +943,9 @@ export default function CatalogPage() {
                     <td>{productMap.get(s.productId)?.name ?? s.productId}</td>
                     <td>{unitMap.get(s.unitOfMeasureId)?.code ?? s.unitOfMeasureId}</td>
                     <td>{s.defaultSellingPrice ?? '—'}</td>
+                    <td>
+                      {s.trackLots ? (s.trackExpiry ? 'Lots + Expiry' : 'Lots Only') : '—'}
+                    </td>
                     <td>
                       <span
                         className={`badge ${
@@ -886,6 +997,26 @@ export default function CatalogPage() {
           </div>
         )}
       </div>
+
+      {editingSkuId && (
+        <OpeningLotCutoverModal
+          open={cutoverOpen}
+          mode="cutover"
+          sku={{
+            id: editingSkuId,
+            code: skuCode,
+            name: skuName,
+            trackExpiry: skuTrackExpiry,
+          }}
+          locations={cutoverLocations}
+          onClose={() => {
+            setCutoverOpen(false);
+            setPendingSkuPayload(null);
+          }}
+          onSkipProspective={handleSkipProspectiveCutover}
+          onConfirmAssign={handleConfirmOpeningAssign}
+        />
+      )}
     </AppShell>
   );
 }

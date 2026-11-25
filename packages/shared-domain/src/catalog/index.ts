@@ -66,19 +66,28 @@ export const SkuSchema = z.object({
   code: z.string().min(1),
   name: z.string().min(1),
   defaultSellingPrice: zMoney.nullable(),
+  trackLots: z.boolean(),
+  trackExpiry: z.boolean(),
   status: CatalogStatusSchema,
   createdAt: z.string(),
   updatedAt: z.string(),
 });
 export type Sku = z.infer<typeof SkuSchema>;
 
-export const CreateSkuSchema = z.object({
-  productId: z.string().uuid(),
-  unitOfMeasureId: z.string().uuid(),
-  code: z.string().trim().min(1, 'SKU code is required').max(64),
-  name: z.string().trim().min(1, 'SKU name is required').max(200),
-  defaultSellingPrice: zMoney.nullable().optional(),
-});
+export const CreateSkuSchema = z
+  .object({
+    productId: z.string().uuid(),
+    unitOfMeasureId: z.string().uuid(),
+    code: z.string().trim().min(1, 'SKU code is required').max(64),
+    name: z.string().trim().min(1, 'SKU name is required').max(200),
+    defaultSellingPrice: zMoney.nullable().optional(),
+    trackLots: z.boolean().default(false),
+    trackExpiry: z.boolean().default(false),
+  })
+  .refine((data) => !data.trackExpiry || data.trackLots, {
+    message: 'trackExpiry cannot be enabled when trackLots is false',
+    path: ['trackExpiry'],
+  });
 export type CreateSkuInput = z.infer<typeof CreateSkuSchema>;
 
 export const UpdateSkuSchema = z.object({
@@ -87,6 +96,8 @@ export const UpdateSkuSchema = z.object({
   code: z.string().trim().min(1, 'SKU code cannot be empty').max(64).optional(),
   name: z.string().trim().min(1, 'SKU name cannot be empty').max(200).optional(),
   defaultSellingPrice: zMoney.nullable().optional(),
+  trackLots: z.boolean().optional(),
+  trackExpiry: z.boolean().optional(),
 });
 export type UpdateSkuInput = z.infer<typeof UpdateSkuSchema>;
 

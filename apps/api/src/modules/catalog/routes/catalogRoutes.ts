@@ -14,6 +14,7 @@ import {
   UpdateSkuSchema,
   UpdateUnitOfMeasureSchema,
   UuidParamSchema,
+  ValidationError,
   uuidv7,
 } from '@iv2/shared-domain';
 import { type SQL, and, eq, ilike, or } from 'drizzle-orm';
@@ -671,8 +672,22 @@ export function registerCatalogRoutes(
       },
     },
     async (request, reply) => {
-      const { productId, unitOfMeasureId, code, name, defaultSellingPrice } = request.body;
+      const {
+        productId,
+        unitOfMeasureId,
+        code,
+        name,
+        defaultSellingPrice,
+        trackLots,
+        trackExpiry,
+      } = request.body;
       return runCommand(request, reply, { action: 'create', resource: 'sku' }, async (ctx) => {
+        if (trackExpiry && !trackLots) {
+          throw new ValidationError(
+            ERROR_CODES.INVALID_LOT_CONFIGURATION,
+            'trackExpiry cannot be enabled when trackLots is false',
+          );
+        }
         await assertProductExists(ctx.tx, productId);
         await assertUnitOfMeasureExists(ctx.tx, unitOfMeasureId);
         await assertNoSkuCodeConflict(ctx.tx, code);
@@ -690,6 +705,8 @@ export function registerCatalogRoutes(
               code,
               name,
               defaultSellingPrice: defaultSellingPrice ?? null,
+              trackLots,
+              trackExpiry,
               status: 'ACTIVE',
               createdAt: now,
               updatedAt: now,
@@ -813,7 +830,15 @@ export function registerCatalogRoutes(
     },
     async (request, reply) => {
       const { id } = request.params;
-      const { productId, unitOfMeasureId, code, name, defaultSellingPrice } = request.body;
+      const {
+        productId,
+        unitOfMeasureId,
+        code,
+        name,
+        defaultSellingPrice,
+        trackLots,
+        trackExpiry,
+      } = request.body;
       return runCommand(request, reply, { action: 'update', resource: 'sku' }, async (ctx) => {
         const [existing] = await ctx.tx
           .select()
@@ -822,6 +847,15 @@ export function registerCatalogRoutes(
           .limit(1);
         if (!existing) {
           throw new NotFoundError(ERROR_CODES.NOT_FOUND, `SKU ${id} not found`);
+        }
+
+        const nextTrackLots = trackLots ?? existing.trackLots;
+        const nextTrackExpiry = trackExpiry ?? existing.trackExpiry;
+        if (nextTrackExpiry && !nextTrackLots) {
+          throw new ValidationError(
+            ERROR_CODES.INVALID_LOT_CONFIGURATION,
+            'trackExpiry cannot be enabled when trackLots is false',
+          );
         }
 
         if (productId !== undefined) {
@@ -844,6 +878,8 @@ export function registerCatalogRoutes(
               ...(code !== undefined ? { code } : {}),
               ...(name !== undefined ? { name } : {}),
               ...(defaultSellingPrice !== undefined ? { defaultSellingPrice } : {}),
+              ...(trackLots !== undefined ? { trackLots } : {}),
+              ...(trackExpiry !== undefined ? { trackExpiry } : {}),
               updatedAt: new Date(),
             })
             .where(eq(catalogSkus.id, id))
